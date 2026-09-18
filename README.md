@@ -1,4 +1,4 @@
-# Directory Objects Migrator v1.0
+# Directory Objects Migrator
 
 Инструмент для миграции объектов Active Directory из Microsoft AD в Samba AD.
 
