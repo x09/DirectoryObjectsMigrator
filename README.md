@@ -106,7 +106,8 @@ apt-get install python3-module-ldap3 python3-module-PyQt5 python3-modules-sqlite
 - CONFLICT: Конфликты объектов
 
 ## База данных
-SQLite база данных находится в ~/.config/DirectoryObjectsMigrator/migration.db
+SQLite база данных находится в `~/.config/DirectoryObjectsMigrator/migration.db`
+
 Операции по ее очистке, бэкапу доступны из раздела настройки соединений.
 
 ## Отчеты
