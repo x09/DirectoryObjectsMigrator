@@ -78,7 +78,7 @@ apt-get install python3-module-ldap3 python3-module-PyQt5 python3-modules-sqlite
 - DEFERRED ссылки разрешаются при доступности целевых объектов
 - Группы обновляются новыми членами
 
-## Ограничения v1.0
+## Ограничения
 
 - ❌ Миграция паролей (технически невозможно через LDAP)
 - ❌ DNS зоны
