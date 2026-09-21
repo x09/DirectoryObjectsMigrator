@@ -96,7 +96,7 @@ apt-get install python3-module-ldap3 python3-module-PyQt5 python3-modules-sqlite
 
 ## Логирование
 
-Логи сохраняются в `~/.config/DirectoryObjectMigrator/logs/migration_YYYYMMDD_HHMMSS.log`
+Логи сохраняются в `~/.config/DirectoryObjectsMigrator/logs/migration_YYYYMMDD_HHMMSS.log`
 
 Уровни:
 - INFO: Информационные сообщения
@@ -104,6 +104,10 @@ apt-get install python3-module-ldap3 python3-module-PyQt5 python3-modules-sqlite
 - WARNING: Предупреждения (EXISTS, DEFERRED)
 - ERROR: Ошибки
 - CONFLICT: Конфликты объектов
+
+## База данных
+SQLite база данных находится в ~/.config/DirectoryObjectsMigrator/migration.db
+Операции по ее очистке, бэкапу доступны из раздела настройки соединений.
 
 ## Отчеты
 
