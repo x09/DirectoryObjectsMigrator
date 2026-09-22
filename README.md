@@ -14,6 +14,10 @@
 - Графический интерфейс на PyQt5
 - Детальное логирование и отчеты
 
+<img width="1387" height="882" alt="изображение" src="https://github.com/user-attachments/assets/e7a75129-5090-40ca-b9e6-5289a936037b" />
+
+
+
 ## Требования
 
 ### Системные пакеты (ALT Linux)
