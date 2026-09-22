@@ -1,0 +1,3 @@
+"""
+Object handlers package initialization
+"""

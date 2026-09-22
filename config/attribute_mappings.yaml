@@ -1,0 +1,300 @@
+# Attribute Mappings Configuration
+# Defines which attributes to migrate for each object type
+
+# Global settings
+global:
+  # Domain suffix transformation
+  transform_upn_suffix: true
+  transform_email_suffix: true
+
+  # Password settings
+  password_policy: random  # 'random' or 'fixed'
+  password_length: 12
+  password_charset: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+
+  # User account settings
+  create_users_disabled: true
+  transfer_account_disabled_flag: true
+
+# Attributes that should NEVER be copied (system-generated)
+global_ignore_attributes:
+  - objectGUID
+  - objectSid
+  - sIDHistory
+  - uSNCreated
+  - uSNChanged
+  - uSNSource
+  - whenCreated
+  - whenChanged
+  - modifyTimeStamp
+  - createTimeStamp
+  - dSCorePropagationData
+  - instanceType
+  - objectCategory
+  - distinguishedName
+  - canonicalName
+  - lastKnownParent
+  - masteredBy
+  - replicatedFrom
+  - replUpToDateVector
+  - systemFlags
+  - isCriticalSystemObject
+
+  # Password and security
+  - unicodePwd
+  - ntPwdHistory
+  - lmPwdHistory
+  - pwdLastSet
+  # Set explicitly by UserHandler, never copied from source
+  - userAccountControl
+  - badPwdCount
+  - badPasswordTime
+  - lastLogon
+  - lastLogonTimestamp
+  - logonCount
+  - lockoutTime
+  - ntSecurityDescriptor
+  - msDS-KeyVersionNumber
+  - supplementalCredentials
+
+  # Replication metadata
+  - replPropertyMetaData
+  - replOriginatingTime
+  - mS-DS-ConsistencyGuid
+
+  # Exchange-specific (ignore all)
+  - msExchMailboxGuid
+  - msExchRecipientDisplayType
+  - msExchRecipientTypeDetails
+  - msExchVersion
+  - homeMDB
+  - homeMTA
+  - legacyExchangeDN
+  - mailNickname
+  - msExchHomeServerName
+  - msExchUserAccountControl
+  - msExchArchiveGUID
+  - msExchArchiveName
+  - msExchRemoteRecipientType
+  - msExchMailboxAuditEnable
+
+  # Other MS-specific
+  - msDS-SupportedEncryptionTypes
+  - msDS-cloudExtensionAttribute1
+  - msDS-cloudExtensionAttribute2
+
+# Organizational Units (OU)
+organizational_unit:
+  required_attributes:
+    - ou
+
+  optional_attributes:
+    - description
+    - managedBy
+    - street
+    - l  # locality
+    - st  # state
+    - postalCode
+    - c  # country
+    - co  # country name
+    - telephoneNumber
+    - facsimileTelephoneNumber
+
+  reference_attributes:
+    - managedBy  # DN reference
+
+# Users
+user:
+  required_attributes:
+    - cn
+    - sAMAccountName
+
+  optional_attributes:
+    # Name attributes
+    - sn
+    - givenName
+    - initials
+    - displayName
+    - name
+
+    # Contact information
+    - mail
+    - userPrincipalName
+    - proxyAddresses
+    - telephoneNumber
+    - mobile
+    - facsimileTelephoneNumber
+    - ipPhone
+    - pager
+    - homePhone
+    - otherTelephone
+    - otherMobile
+
+    # Location
+    - physicalDeliveryOfficeName
+    - streetAddress
+    - postOfficeBox
+    - l  # locality/city
+    - st  # state/province
+    - postalCode
+    - c  # country
+    - co  # country name
+
+    # Organization
+    - title
+    - department
+    - company
+    - division
+    - employeeID
+    - employeeNumber
+    - employeeType
+
+    # Logon information
+    - userWorkstations
+    - homeDirectory
+    - homeDrive
+    - scriptPath
+    - profilePath
+
+    # Account settings
+    - accountExpires
+    # userAccountControl is deliberately absent: UserHandler computes it so every
+    # account is created disabled (514) in a single LDAP add. Copying the source
+    # value would leave the account enabled between the add and the next modify.
+
+    # Additional info
+    - description
+    - info
+    - comment
+    - wWWHomePage
+    - url
+
+  reference_attributes:
+    - manager  # DN reference
+    # directReports is auto-generated, don't copy
+
+  transform_attributes:
+    # These attributes need domain suffix transformation
+    - userPrincipalName  # user@source.alt -> user@dest.alt
+    - mail  # if matches domain
+    - proxyAddresses  # SMTP:user@source.alt -> SMTP:user@dest.alt
+
+# Groups
+group:
+  required_attributes:
+    - cn
+    - sAMAccountName
+    - groupType
+
+  optional_attributes:
+    - description
+    - info
+    - mail
+    - proxyAddresses
+    - displayName
+    - name
+    - wWWHomePage
+    - url
+
+  reference_attributes:
+    - member  # DN reference (multi-valued)
+    - managedBy  # DN reference
+    # memberOf is auto-generated, don't copy
+
+  transform_attributes:
+    - mail
+    - proxyAddresses
+
+# Contacts
+contact:
+  required_attributes:
+    - cn
+
+  optional_attributes:
+    - displayName
+    - name
+    - sn
+    - givenName
+    - initials
+    - mail
+    - proxyAddresses
+    - telephoneNumber
+    - mobile
+    - facsimileTelephoneNumber
+    - homePhone
+    - pager
+    - physicalDeliveryOfficeName
+    - streetAddress
+    - l
+    - st
+    - postalCode
+    - c
+    - co
+    - title
+    - company
+    - department
+    - description
+    - info
+    - wWWHomePage
+    - url
+
+  reference_attributes: []
+
+  transform_attributes:
+    - mail
+    - proxyAddresses
+
+# Object classes to ignore completely
+ignored_object_classes:
+  - computer
+  - printQueue
+  - volume
+  - msFVE-RecoveryInformation
+  - rIDManager
+  - rIDSet
+  - secret
+  - trustedDomain
+  - foreignSecurityPrincipal
+  - dnsNode
+  - dnsZone
+  - groupPolicyContainer
+  - site
+  - subnet
+  - siteLink
+  - interSiteTransport
+  - nTDSDSA
+  - nTDSConnection
+  - server
+  - configuration
+
+# Built-in containers to ignore (DN patterns)
+ignored_dn_patterns:
+  - "CN=Builtin,DC="
+  - "CN=Users,DC="
+  - "CN=Computers,DC="
+  - "CN=ForeignSecurityPrincipals,DC="
+  - "CN=Managed Service Accounts,DC="
+  - "CN=Program Data,DC="
+  - "CN=Microsoft Exchange System Objects,DC="
+  - "CN=System,DC="
+  - "CN=LostAndFound,DC="
+  - "CN=Infrastructure,DC="
+  - "CN=Configuration,DC="
+  - "CN=Schema,CN=Configuration,DC="
+
+# Special handling rules
+special_rules:
+  # primaryGroupID: always set to 513 (Domain Users)
+  primary_group_id: 513
+
+  # sAMAccountName conflicts
+  sam_account_name_conflict_resolution: skip  # 'skip', 'rename', 'error'
+
+  # DN conflicts
+  dn_conflict_resolution: skip  # 'skip', 'error'
+
+  # Attribute size limits (some attributes can be very large)
+  max_attribute_size: 1048576  # 1MB
+
+  # Multi-valued attribute limits
+  max_multivalue_count: 1000
