@@ -11,7 +11,8 @@ from pathlib import Path
 # that is not on the default sys.path. Append rather than insert, so that project
 # packages such as config/ and utils/ always win over anything installed there.
 for extra_path in ('/usr/lib64/python3/site-packages',
-                   '/usr/lib/python3/site-packages'):
+                   '/usr/lib/python3/site-packages',
+                   '/usr/share/DirectoryObjectsMigrator'):
     if Path(extra_path).is_dir() and extra_path not in sys.path:
         sys.path.append(extra_path)
 
