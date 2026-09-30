@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Directory Objects Migrator
+Comment[en]=A tool for migrating Active Directory objects from Microsoft AD to Samba AD
+Comment=Инструмент для миграции объектов Active Directory из Microsoft AD в Samba AD
+Exec=/usr/bin/DirectoryObjectsMigrator
+Icon=DirectoryObjectsMigrator
+Terminal=false
+Categories=System;Network;;
+Keywords=migrator;samba;ad;
+StartupNotify=true
