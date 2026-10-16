@@ -18,6 +18,7 @@ PROJECT_ROOT = TESTS_DIR.parent
 
 # Ordered so that fast, low-level checks fail first
 SUITES = [
+    ("Source branch browser (lazy LDAP and GUI threads)", "test_branch_dialog.py", True),
     ('Unit tests (DN, database, statistics, LDAP)', 'test_units.py', False),
     ('Ignore rules (built-in containers)',          'test_ignore_rules.py', False),
     ('Custom exclusions (operator-defined DN list)', 'test_custom_exclusions.py', False),
