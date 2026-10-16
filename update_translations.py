@@ -298,6 +298,39 @@ RU.update({
 })
 
 
+RU.update({
+    'Choose…': 'Выбрать…',
+    'Select migration branch': 'Выбор ветки для миграции',
+    'Select one branch of the source domain. All nested objects are included.':
+        'Выберите одну ветку исходного домена. Все вложенные объекты будут включены в область миграции.',
+    'Branch': 'Ветка',
+    'Type': 'Тип',
+    'Selected DN:': 'Выбранный DN:',
+    'Only objects visible to your account are shown. Migration exclusions still apply.':
+        'Показаны только объекты, доступные вашей учётной записи. Правила исключения объектов при миграции сохраняются.',
+    'Refresh tree': 'Обновить дерево',
+    'Select': 'Выбрать',
+    'Domain': 'Домен',
+    'Loading branch…': 'Загрузка ветки…',
+    'Could not load branch. Expand it again to retry, or refresh the tree.':
+        'Не удалось загрузить ветку. Раскройте её повторно или обновите дерево.',
+    'Organizational unit': 'Подразделение',
+    'Container': 'Контейнер',
+    'Select a branch, then click Select.': 'Выделите ветку и нажмите «Выбрать».',
+    'Closing connection… Waiting for the current LDAP request to finish.':
+        'Закрытие соединения… Ожидание завершения текущего LDAP-запроса.',
+})
+
+
+RU.update({
+    'Custom Exclusions': 'Пользовательские исключения',
+    'CN=User1,OU=Test,DC=example,DC=com\n# This is a comment\nCN=User2,OU=Test,DC=example,DC=com':
+        'CN=User1,OU=Test,DC=example,DC=com\n# Это комментарий\nCN=User2,OU=Test,DC=example,DC=com',
+    'Enter Distinguished Names (DNs) to exclude from migration, one per line.\nLines starting with # or ; are treated as comments.\nExample: CN=TestUser,OU=Sales,DC=example,DC=com':
+        'Введите DN объектов, которые нужно исключить из миграции, по одному в строке.\nСтроки, начинающиеся с # или ;, считаются комментариями.\nПример: CN=TestUser,OU=Sales,DC=example,DC=com',
+})
+
+
 def build_catalogue(lang: str, lang_name: str, msgids) -> str:
     lines = [HEADER.format(
         lang=lang,
