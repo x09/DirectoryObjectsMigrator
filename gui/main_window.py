@@ -11,6 +11,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QTextCursor
 
 from gui.connection_dialog import ConnectionDialog
+from gui.branch_dialog import BranchDialog
 from gui.preview_dialog import PreviewDialog
 from gui.progress_window import ProgressWindow
 
@@ -149,6 +150,10 @@ class MainWindow(QMainWindow):
         if last_dn:
             self.base_dn_input.setText(last_dn)
         base_dn_layout.addWidget(self.base_dn_input)
+        self.browse_base_dn_btn = QPushButton(_("Choose…"))
+        self.browse_base_dn_btn.clicked.connect(self._browse_base_dn)
+        base_dn_layout.addWidget(self.browse_base_dn_btn)
+        self.base_dn_input.textChanged.connect(self._invalidate_analysis)
         settings_layout.addLayout(base_dn_layout)
 
         # Options
@@ -261,11 +266,29 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         """Open settings dialog"""
+        previous_configs = {
+            'source': self.config_manager.get_source_dc_config(),
+            'dest': self.config_manager.get_dest_dc_config(),
+        }
         dialog = ConnectionDialog(self.config_manager, self)
         dialog.connections_saved.connect(self._check_connections)
         dialog.database_reset.connect(self._on_database_reset)
 
         if dialog.exec_() == ConnectionDialog.Accepted:
+            for dc_type, current in (
+                ('source', self.config_manager.get_source_dc_config()),
+                ('dest', self.config_manager.get_dest_dc_config()),
+            ):
+                if current != previous_configs[dc_type]:
+                    self._session_passwords[dc_type] = None
+                    conn = self.source_conn if dc_type == 'source' else self.dest_conn
+                    if conn:
+                        conn.disconnect()
+                    if dc_type == 'source':
+                        self.source_conn = None
+                    else:
+                        self.dest_conn = None
+                    self._invalidate_analysis()
             # Adopt any passwords typed in the dialog for this session, so the user
             # is not asked again. They are still never written to the INI file.
             self._cache_passwords_from_dialog(dialog)
@@ -432,6 +455,37 @@ class MainWindow(QMainWindow):
 
         # Enable analyze button if both configured
         self.analyze_btn.setEnabled(source_ok and dest_ok)
+        self.browse_base_dn_btn.setEnabled(source_ok)
+
+    def _invalidate_analysis(self, *args):
+        """A plan applies only to the scope against which it was built."""
+        self.analysis_result = None
+        self.migration_plan = None
+        self.migrate_btn.setEnabled(False)
+
+    def _source_browser_connection_failed(self):
+        self._session_passwords['source'] = None
+
+    def _browse_base_dn(self):
+        config = self.config_manager.get_source_dc_config()
+        if not all(config.get(key) for key in ('host', 'domain', 'username')):
+            QMessageBox.warning(self, _("Error"), _("Please configure connections first"))
+            return
+        try:
+            password = self._get_password('source', config['host'], config['domain'], config['username'])
+        except LDAPConnectionError:
+            return
+        params = dict(
+            host=config['host'], port=config['port'], domain=config['domain'],
+            username=config['username'], password=password,
+            use_tls=config.get('use_tls', settings.DEFAULT_USE_TLS),
+        )
+        dialog = BranchDialog(params, self)
+        dialog.connection_failed.connect(self._source_browser_connection_failed)
+        if dialog.exec_() == BranchDialog.Accepted:
+            self.base_dn_input.setText(dialog.selected_dn)
+            self.config_manager.set_last_base_dn(dialog.selected_dn)
+        dialog.deleteLater()
 
     def _append_log(self, level: str, message: str):
         """Append log message"""

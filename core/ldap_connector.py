@@ -266,6 +266,54 @@ class LDAPConnector:
         except ldap3.core.exceptions.LDAPException as e:
             raise LDAPOperationError(f"Search error: {e}")
 
+    def list_child_containers(self, parent_dn: str, cancelled=None) -> List[Dict[str, Any]]:
+        """Read one level of OU/container children, consuming every LDAP page.
+
+        Keep the server's DN verbatim (names may contain escaped commas). No
+        users, memberships or migration state are read or written here. A failed
+        page raises instead of presenting a partial branch as a complete one.
+        Continuation references (e.g. AD DNS application partitions) are not
+        children of this domain tree. Ignore them without following other servers.
+        """
+        self._ensure_connected()
+        original_auto_referrals = self.connection.auto_referrals
+        self.connection.auto_referrals = False
+        try:
+            rows = self.connection.extend.standard.paged_search(
+                search_base=parent_dn,
+                search_filter='(|(objectClass=organizationalUnit)(objectClass=container))',
+                search_scope=ldap3.LEVEL,
+                attributes=['name', 'objectClass'],
+                paged_size=500,
+                generator=True,
+            )
+            children = []
+            for row in rows:
+                if cancelled and cancelled():
+                    return []
+                if row.get('type') == 'searchResRef':
+                    continue
+                if row.get('type') != 'searchResEntry':
+                    continue
+                attrs = {k.lower(): v for k, v in row.get('attributes', {}).items()}
+                name = attrs.get('name') or row['dn']
+                if isinstance(name, list):
+                    name = name[0] if name else row['dn']
+                classes = attrs.get('objectclass', [])
+                if isinstance(classes, str):
+                    classes = [classes]
+                children.append({
+                    'dn': row['dn'], 'name': str(name),
+                    'kind': 'ou' if any(c.lower() == 'organizationalunit' for c in classes) else 'container',
+                })
+            if self.connection.result.get('result', 0) != 0:
+                raise LDAPOperationError(f"Cannot load branch: {self.connection.result}")
+            return sorted(children, key=lambda row: (row['name'].casefold(), row['dn'].casefold()))
+        except ldap3.core.exceptions.LDAPException as e:
+            raise LDAPOperationError(f"Cannot load branch {parent_dn}: {e}") from e
+        finally:
+            self.connection.auto_referrals = original_auto_referrals
+
     def get_object_by_dn(self, dn: str, attributes: List[str] = None) -> Optional[Dict[str, Any]]:
         """
         Get a single object by DN
