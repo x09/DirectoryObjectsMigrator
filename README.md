@@ -16,6 +16,7 @@
 
 <img width="1387" height="882" alt="изображение" src="https://github.com/user-attachments/assets/e7a75129-5090-40ca-b9e6-5289a936037b" />
 
+<img width="998" height="718" alt="изображение" src="https://github.com/user-attachments/assets/9623763a-d05c-4283-a508-539eba0fc397" />
 
 
 ## Требования
