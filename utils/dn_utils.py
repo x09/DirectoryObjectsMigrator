@@ -90,8 +90,15 @@ class DNUtils:
         if not dn:
             return ""
 
-        parts = dn.split(',', 1)
-        return parts[1].strip() if len(parts) > 1 else ""
+        escaped = False
+        for index, char in enumerate(dn):
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == ',':
+                return dn[index + 1:].strip()
+        return ""
 
     @staticmethod
     def get_depth(dn: str) -> int:

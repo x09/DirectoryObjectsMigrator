@@ -18,6 +18,12 @@ PROJECT_ROOT = TESTS_DIR.parent
 
 # Ordered so that fast, low-level checks fail first
 SUITES = [
+    ("Complete ranged LDAP reads", "test_ranged_reads.py", False),
+    ("Password policy, fallback and outcomes", "test_password_fallback.py", True),
+    ("Object, attribute and membership verification", "test_content_verification.py", False),
+    ("Paged analysis and destination preflight", "test_paging_preflight.py", False),
+    ("Domain isolation and verified object identities", "test_identity_tracking.py", False),
+    ("LDAP failures, retryability and migration outcomes", "test_migration_outcomes.py", True),
     ("Source branch browser (lazy LDAP and GUI threads)", "test_branch_dialog.py", True),
     ('Unit tests (DN, database, statistics, LDAP)', 'test_units.py', False),
     ('Ignore rules (built-in containers)',          'test_ignore_rules.py', False),

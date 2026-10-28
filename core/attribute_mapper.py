@@ -33,6 +33,10 @@ class AttributeMapper:
         try:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 self.config = yaml.safe_load(f)
+                # Runtime handlers use "ou"; the shipped YAML names this section
+                # "organizational_unit". Preserve explicit custom "ou" overrides.
+                if 'ou' not in self.config and 'organizational_unit' in self.config:
+                    self.config['ou'] = self.config['organizational_unit']
         except Exception as e:
             raise RuntimeError(f"Failed to load attribute mappings: {e}")
 

@@ -12,6 +12,16 @@ from PyQt5.QtGui import QTextCursor, QColor, QTextCharFormat
 from utils.i18n import _
 
 
+def completion_title(status):
+    return {
+        'completed': _("Migration completed successfully"),
+        'completed_with_errors': _("Migration completed with errors"),
+        'completed_with_warnings': _("Migration completed with warnings"),
+        'cancelled': _("Migration cancelled"),
+        'failed': _("Migration failed"),
+    }.get(status, _("Migration failed"))
+
+
 class ProgressWindow(QDialog):
     """Dialog showing migration progress"""
 
@@ -146,7 +156,7 @@ class ProgressWindow(QDialog):
         scrollbar = self.log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def set_complete(self, success: bool, message: str):
+    def set_complete(self, success: bool, message: str, status: str = None):
         """
         Mark migration as complete
 
@@ -155,14 +165,14 @@ class ProgressWindow(QDialog):
             message: Completion message
         """
         self.migration_complete = True
-        self.progress_bar.setValue(100)
-
-        if success:
-            self.status_label.setText(_("Migration completed successfully"))
-            self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: green; margin: 10px;")
-        else:
-            self.status_label.setText(_("Migration failed"))
-            self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: red; margin: 10px;")
+        status = status or ('completed' if success else 'failed')
+        if status in ('completed', 'completed_with_warnings', 'completed_with_errors'):
+            self.progress_bar.setValue(100)
+        color = {'completed': 'green', 'completed_with_warnings': '#b36b00',
+                 'cancelled': '#b36b00'}.get(status, 'red')
+        self.status_label.setText(completion_title(status))
+        self.status_label.setStyleSheet(
+            f'font-size: 14px; font-weight: bold; color: {color}; margin: 10px;')
 
         self.append_log('INFO', message)
 

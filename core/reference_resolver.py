@@ -3,10 +3,12 @@ Reference Resolver
 Handles resolution of reference attributes (member, manager, managedBy)
 Manages deferred references when targets are outside migration scope
 """
+from utils.i18n import _
 from typing import Dict, Any, List, Optional, Set, Tuple
 import ldap3
 from core.ldap_connector import LDAPConnector
 from core.ignore_rules import IgnoreRules
+from core.identity import validate_destination, guid_text, MappingValidationError
 from database.migration_db import MigrationDB
 from utils.logger import MigrationLogger
 from utils.dn_utils import DNUtils
@@ -122,57 +124,38 @@ class ReferenceResolver:
 
         return {DNUtils.normalize_dn(str(v)) for v in values if v}
 
-    def resolve_reference(self, source_dn: str) -> Optional[str]:
-        """
-        Resolve a source DN to destination DN using migration_map
-
-        Args:
-            source_dn: Source object DN
-
-        Returns:
-            Destination DN if found, None otherwise
-        """
-        # Lookup in migration_map
-        map_entry = self.migration_db.get_object_by_source_dn(source_dn)
-
-        if map_entry and map_entry.get('dest_dn'):
-            return map_entry['dest_dn']
-
-        # The database has no record, but the object might still exist in the
-        # destination if it was migrated before a database reset, or manually
-        # created. Check by sAMAccountName, because DN can differ (different base).
-        try:
-            source_obj = self.source_conn.get_object_by_dn(
-                source_dn, attributes=['sAMAccountName', 'objectClass'])
-            if not source_obj:
+    def resolve_reference(self, source_dn: str, source_guid=None, update_mapping=True) -> Optional[str]:
+        """Use verified GUID mappings only. A matching login is never identity."""
+        if source_guid:
+            source = self.source_conn.get_object_by_guid(source_guid, base_dn=self.source_domain_dn)
+            if source is None or guid_text(source['attributes'].get('objectGUID')) != guid_text(source_guid):
+                raise MappingValidationError(_('Referenced source object no longer exists'))
+        else:
+            source = self.source_conn.get_object_by_dn(source_dn, attributes=['objectGUID'])
+            if source is None:
+                previous = self.migration_db.get_object_by_source_dn(source_dn)
+                if previous:
+                    return self.resolve_reference(source_dn, previous['source_guid'], update_mapping=update_mapping)
                 return None
+        if source is None:
+            return None
+        guid = guid_text(source['attributes'].get('objectGUID'))
+        mapped = self.migration_db.get_object_by_source_guid(guid)
+        if mapped is None:
+            return None
+        dest_dn = validate_destination(self.dest_conn, mapped)
+        if not self.dry_run and update_mapping:
+            self.migration_db.refresh_mapping(guid, source['dn'], dest_dn)
+        return dest_dn
 
-            sam = source_obj['attributes'].get('sAMAccountName')
-            if not sam:
-                return None
-
-            # Search the entire destination domain by sAMAccountName
-            dest_entries = self.dest_conn.search(
-                base_dn=self.dest_domain_dn,
-                search_filter=f'(sAMAccountName={sam})',
-                scope=ldap3.SUBTREE,
-                attributes=['distinguishedName', 'sAMAccountName']
-            )
-            # The filter might not be enforced by all LDAP implementations (especially
-            # test doubles), so verify the match explicitly.
-            for entry in dest_entries:
-                entry_sam = entry.get('attributes', {}).get('sAMAccountName')
-                if entry_sam == sam:
-                    dest_dn = entry['dn']
-                    self.logger.debug(
-                        f"Reference target {source_dn} found in destination as {dest_dn} "
-                        f"(not in migration_map; possibly migrated before DB reset)")
-                    return dest_dn
-
-        except Exception as e:
-            self.logger.debug(f"Could not check destination for {source_dn}: {e}")
-
-        return None
+    def _defer(self, parent_guid, parent_dn, parent_type, attr_name, source_dn, run_id):
+        # Capture identity now so later renames/replacements cannot redirect it.
+        source = self.source_conn.get_object_by_dn(source_dn, attributes=['objectGUID'])
+        guid = guid_text(source['attributes'].get('objectGUID')) if source else None
+        self.migration_db.add_deferred_reference(
+            parent_guid=parent_guid, parent_dn=parent_dn, parent_type=parent_type,
+            attribute_name=attr_name, referenced_dn=source_dn, run_id=run_id,
+            referenced_guid=guid)
 
     def resolve_references(
         self,
@@ -206,6 +189,7 @@ class ReferenceResolver:
 
         for attr_name, ref_dns in references.items():
             resolved_dns = []
+            resolved_sources = []
             deferred_dns = []
             # (member name, status) pairs for the per-member log block
             member_status = []
@@ -216,7 +200,11 @@ class ReferenceResolver:
 
             for ref_dn in ref_dns:
                 # Try to resolve
-                dest_ref_dn = self.resolve_reference(ref_dn)
+                try:
+                    dest_ref_dn = self.resolve_reference(ref_dn)
+                except Exception as exc:
+                    dest_ref_dn = None
+                    self.logger.warning(f'Reference identity not verified for {ref_dn}: {exc}')
                 name = DNUtils.extract_cn(ref_dn) or ref_dn
 
                 if dest_ref_dn:
@@ -227,6 +215,7 @@ class ReferenceResolver:
 
                     # Resolved
                     resolved_dns.append(dest_ref_dn)
+                    resolved_sources.append(ref_dn)
                     stats['resolved'] += 1
                     member_status.append((name, 'ADDED'))
                 else:
@@ -247,14 +236,9 @@ class ReferenceResolver:
                     member_status.append((name, 'DEFERRED'))
 
                     # Add to deferred_references table
-                    self.migration_db.add_deferred_reference(
-                        parent_guid=parent_guid,
-                        parent_dn=parent_dn,
-                        parent_type=parent_type,
-                        attribute_name=attr_name,
-                        referenced_dn=ref_dn,
-                        run_id=run_id
-                    )
+                    if not self.dry_run:
+                        self._defer(parent_guid, parent_dn, parent_type, attr_name, ref_dn, run_id)
+
 
             # Set resolved references on destination object
             if resolved_dns:
@@ -265,10 +249,23 @@ class ReferenceResolver:
                     )
                 else:
                     try:
-                        self.dest_conn.modify_add_values(parent_dn, {attr_name: resolved_dns})
+                        if not self.dest_conn.modify_add_values(parent_dn, {attr_name: resolved_dns}):
+                            raise RuntimeError('LDAP reference update returned False')
                     except Exception as e:
                         self.logger.warning(f"Failed to set {attr_name} on {parent_dn}: {e}")
                         stats['failed'] += len(resolved_dns)
+                        stats['resolved'] -= len(resolved_dns)
+                        self.migration_db.log_error(
+                            run_id, settings.SEVERITY_ERROR, settings.PHASE_REFERENCES,
+                            f'Failed to set {attr_name}: {e}', object_dn=parent_dn,
+                            object_type=parent_type)
+                        # Created parents are skipped on reruns. Preserve failed
+                        # writes as pending work so the next run can retry them.
+                        for source_dn in resolved_sources:
+                            self._defer(parent_guid, parent_dn, parent_type, attr_name, source_dn, run_id)
+                        deferred_dns.extend(resolved_sources)
+                        stats['deferred'] += len(resolved_sources)
+                        resolved_dns = []
                         # The write failed, so nothing was actually added
                         member_status = [(n, 'FAILED' if s == 'ADDED' else s)
                                          for n, s in member_status]
@@ -317,131 +314,93 @@ class ReferenceResolver:
                 self.logger.error(f"    {name}: {status}")
 
     def process_deferred_references(self, run_id: int) -> Tuple[int, int]:
-        """
-        Process all unresolved deferred references
-        Try to resolve them now that more objects may have been migrated
+        """Acknowledge rows only after LDAP confirms the write (or a read finds it).
 
-        Args:
-            run_id: Current migration run ID
-
-        Returns:
-            Tuple of (newly_resolved_count, still_deferred_count)
+        If the server applies a write but its reply is lost, leave the rows pending.
+        The next run's read detects the existing values and completes bookkeeping.
+        Dry runs neither write to LDAP nor change reference tracking.
         """
-        # Get all unresolved references
         unresolved = self.migration_db.get_unresolved_references()
-
-        if not unresolved:
-            self.logger.info("No deferred references to process")
-            return (0, 0)
-
-        self.logger.info(f"Processing {len(unresolved)} deferred references...")
-
+        by_attribute = {}
+        for ref in unresolved:
+            by_attribute.setdefault((ref['parent_object_guid'], ref['parent_object_dn'], ref['attribute_name']), []).append(ref)
         resolved_count = 0
         still_deferred_count = 0
-
-        # Group by parent object for efficiency
-        by_parent = {}
-        for ref in unresolved:
-            parent_dn = ref['parent_object_dn']
-            if parent_dn not in by_parent:
-                by_parent[parent_dn] = []
-            by_parent[parent_dn].append(ref)
-
-        # Process each parent object
-        for parent_dn, refs in by_parent.items():
-            # Group by attribute
-            by_attr = {}
+        for (parent_guid, parent_dn, attr_name), refs in by_attribute.items():
+            try:
+                parent = self.migration_db.get_object_by_source_guid(refs[0]['parent_object_guid'])
+                if parent is None:
+                    raise MappingValidationError(_('No verified mapping for reference parent'))
+                source_parent = self.source_conn.get_object_by_guid(guid_text(parent['source_guid']), base_dn=self.source_domain_dn)
+                if source_parent is None or guid_text(source_parent['attributes'].get('objectGUID')) != guid_text(parent['source_guid']):
+                    raise MappingValidationError(_('Reference parent no longer exists in the source domain'))
+                parent_dn = validate_destination(self.dest_conn, parent)
+                if not self.dry_run:
+                    self.migration_db.refresh_mapping(parent['source_guid'], source_parent['dn'], parent_dn)
+            except Exception as exc:
+                self.logger.error(f'Cannot update reference parent {parent_dn}: {exc}')
+                self.migration_db.log_error(run_id, settings.SEVERITY_ERROR,
+                    settings.PHASE_REFERENCES, str(exc), object_dn=parent_dn)
+                still_deferred_count += len(refs)
+                continue
+            already_set = self.existing_values(parent_dn, attr_name)
+            pending = []
+            member_status = []
             for ref in refs:
-                attr_name = ref['attribute_name']
-                if attr_name not in by_attr:
-                    by_attr[attr_name] = []
-                by_attr[attr_name].append(ref)
-
-            # Try to resolve each attribute's references
-            for attr_name, attr_refs in by_attr.items():
-                resolved_dns = []
-                member_status = []
-                already_set = self.existing_values(parent_dn, attr_name)
-
-                for ref in attr_refs:
-                    ref_id = ref['id']
-                    source_dn = ref['referenced_source_dn']
-                    name = DNUtils.extract_cn(source_dn) or source_dn
-
-                    # Try to resolve now
-                    dest_dn = self.resolve_reference(source_dn)
-
-                    if dest_dn:
-                        if DNUtils.normalize_dn(dest_dn) in already_set:
-                            # Value is already on the object: the row is stale
-                            # bookkeeping, so close it without another write.
-                            member_status.append((name, 'PRESENT'))
-                            resolved_count += 1
-                            if not self.dry_run:
-                                self.migration_db.mark_reference_resolved(
-                                    ref_id, dest_dn, run_id)
-                                self.migration_db.update_reference_check(ref_id)
-                            continue
-
-                        resolved_dns.append(dest_dn)
-                        resolved_count += 1
-                        member_status.append((name, 'ADDED'))
-                        # A dry run must leave the row unresolved, otherwise the
-                        # simulation would consume the pending work and the real
-                        # run would never apply the membership.
+                source_dn = ref['referenced_source_dn']
+                name = DNUtils.extract_cn(source_dn) or source_dn
+                if not self.dry_run:
+                    self.migration_db.update_reference_check(ref['id'])
+                try:
+                    dest_dn = self.resolve_reference(source_dn, ref.get('referenced_source_guid'))
+                except Exception as exc:
+                    self.logger.warning(f'Reference identity not verified for {source_dn}: {exc}')
+                    dest_dn = None
+                if dest_dn:
+                    if DNUtils.normalize_dn(dest_dn) in already_set:
                         if not self.dry_run:
-                            self.migration_db.mark_reference_resolved(ref_id, dest_dn, run_id)
+                            self.migration_db.mark_reference_resolved(ref['id'], dest_dn, run_id)
+                        resolved_count += 1
+                        member_status.append((name, 'PRESENT'))
                     else:
-                        # Rows recorded before built-in principals were filtered, or
-                        # written by an older version, can never resolve. Close them
-                        # instead of carrying them in every future report.
-                        builtin = self.is_builtin_target(source_dn)
-                        if builtin:
-                            member_status.append((name, 'SKIPPED'))
-                            self.logger.debug(
-                                f"Closing unresolvable deferred reference "
-                                f"{attr_name} -> {source_dn}: {builtin}")
-                            if not self.dry_run:
-                                self.migration_db.mark_reference_resolved(
-                                    ref_id, '', run_id)
-                                self.migration_db.update_reference_check(ref_id)
-                            continue
-
-                        still_deferred_count += 1
-                        member_status.append((name, 'DEFERRED'))
-
+                        pending.append((ref, dest_dn, name))
+                elif self.is_builtin_target(source_dn):
                     if not self.dry_run:
-                        self.migration_db.update_reference_check(ref_id)
+                        self.migration_db.mark_reference_resolved(ref['id'], '', run_id)
+                    member_status.append((name, 'SKIPPED'))
+                else:
+                    still_deferred_count += 1
+                    member_status.append((name, 'DEFERRED'))
 
-                # Add resolved references to destination object
-                if resolved_dns:
-                    if self.dry_run:
-                        self.logger.info(
-                            f"[DRY RUN] Would add {len(resolved_dns)} deferred "
-                            f"{attr_name} to {parent_dn}"
-                        )
+            if pending:
+                # Old databases can contain duplicate rows. Send each value once,
+                # but acknowledge every corresponding row after success.
+                values = list(dict.fromkeys(dest_dn for _, dest_dn, _ in pending))
+                if self.dry_run:
+                    self.logger.info(f'[DRY RUN] Would add {len(values)} {attr_name} to {parent_dn}')
+                    resolved_count += len(pending)
+                else:
+                    try:
+                        if not self.dest_conn.modify_add_values(parent_dn, {attr_name: values}):
+                            raise RuntimeError('LDAP reference update returned False')
+                    except Exception as exc:
+                        self.logger.error(f'Failed to add {attr_name} to {parent_dn}: {exc}')
+                        self.migration_db.log_error(
+                            run_id, settings.SEVERITY_ERROR, settings.PHASE_REFERENCES,
+                            f'Failed to add {attr_name}: {exc}', object_dn=parent_dn,
+                            object_type=refs[0]['parent_object_type'])
+                        still_deferred_count += len(pending)
+                        member_status.extend((name, 'FAILED') for _, _, name in pending)
                     else:
-                        try:
-                            self.dest_conn.modify_add_values(parent_dn, {attr_name: resolved_dns})
-                        except Exception as e:
-                            self.logger.error(
-                                f"Failed to add resolved {attr_name} to {parent_dn}: {e}"
-                            )
-                            member_status = [(n, 'FAILED' if s == 'ADDED' else s)
-                                             for n, s in member_status]
-
-                # Only report objects where something actually changed, so a run
-                # with hundreds of still-unresolvable references stays readable.
-                if resolved_dns:
-                    self.logger.info(DNUtils.extract_cn(parent_dn) or parent_dn)
-                    self.log_member_block(parent_dn, attr_name, member_status)
-
-        self.logger.info(
-            f"Deferred reference processing complete: "
-            f"{resolved_count} resolved, {still_deferred_count} still deferred"
-        )
-
-        return (resolved_count, still_deferred_count)
+                        # Database failures propagate: do not misreport them as
+                        # LDAP rejection. Any rows left pending are safe to retry.
+                        for ref, dest_dn, name in pending:
+                            self.migration_db.mark_reference_resolved(ref['id'], dest_dn, run_id)
+                            resolved_count += 1
+                            member_status.append((name, 'ADDED'))
+            self.log_member_block(parent_dn, attr_name, member_status)
+        self.logger.info(f'Deferred references: {resolved_count} resolved, {still_deferred_count} pending')
+        return resolved_count, still_deferred_count
 
     def get_deferred_summary(self) -> Dict[str, Any]:
         """

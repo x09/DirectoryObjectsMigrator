@@ -38,6 +38,23 @@ class PasswordGenerator:
         return password
 
     @staticmethod
+    def generate_compliant(length=12, forbidden=()):
+        """Guarantee all four ASCII categories and avoid account/name tokens."""
+        if length < 4:
+            raise ValueError('Complex passwords require at least four characters')
+        categories = [string.ascii_lowercase, string.ascii_uppercase, string.digits, '_-!@#$%']
+        alphabet = ''.join(categories)
+        tokens = [str(token).casefold() for token in forbidden if len(str(token)) >= 3]
+        for attempt in range(100):
+            chars = [secrets.choice(category) for category in categories]
+            chars += [secrets.choice(alphabet) for _ in range(length - 4)]
+            secrets.SystemRandom().shuffle(chars)
+            password = ''.join(chars)
+            if not any(token in password.casefold() for token in tokens):
+                return password
+        raise ValueError('Could not generate a password avoiding account/name tokens')
+
+    @staticmethod
     def generate_batch(count: int, length: int = DEFAULT_LENGTH, charset: str = None) -> list:
         """
         Generate multiple unique passwords

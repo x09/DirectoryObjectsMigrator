@@ -2,6 +2,7 @@
 Migrator
 Main migration engine - orchestrates the entire migration process
 """
+from utils.i18n import _
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -10,6 +11,7 @@ import ldap3
 
 from core.ldap_connector import LDAPConnector, LDAPConnectionError, LDAPOperationError
 from core.analyzer import Analyzer, AnalysisResult
+from core.identity import domain_identity, validate_destination, MappingValidationError, guid_text
 from core.attribute_mapper import AttributeMapper
 from core.reference_resolver import ReferenceResolver
 from core.verifier import Verifier, VerificationResult
@@ -47,6 +49,9 @@ class MigrationPlan:
         self.deferred: List[tuple] = []
         self.ignored_count: int = 0
         self.unsupported_count: int = 0
+        self.issues = {}  # source DN -> explanation shown in preview
+        self.reference_issues = {}  # (parent DN, attribute, referenced DN) -> reason
+        self.unassigned_history = False
 
     def counts_by_type(self, bucket: List[tuple]) -> Dict[str, int]:
         """Group one bucket by object type, for display."""
@@ -82,6 +87,9 @@ class MigrationPlan:
 class MigrationResult:
     """Result of migration operation"""
     success: bool = False
+    status: str = settings.RUN_STATUS_IN_PROGRESS
+    warnings: List[str] = field(default_factory=list)
+    failure_message: str = ""
     run_id: Optional[int] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -121,7 +129,8 @@ class Migrator:
         batch_size: int = settings.DEFAULT_BATCH_SIZE,
         dry_run: bool = False,
         progress_callback: Optional[Callable[[int, str], None]] = None,
-        custom_exclusions: Optional[List[str]] = None
+        custom_exclusions: Optional[List[str]] = None,
+        password_length: int = settings.DEFAULT_PASSWORD_LENGTH
     ):
         """
         Initialize migrator
@@ -144,7 +153,9 @@ class Migrator:
         """
         self.source_conn = source_conn
         self.dest_conn = dest_conn
-        self.migration_db = migration_db
+        self.migration_db = migration_db.for_direction(
+            domain_identity(source_conn), domain_identity(dest_conn),
+            source_conn.domain, dest_conn.domain)
         self.logger = logger
         self.batch_size = batch_size
         self.dry_run = dry_run
@@ -156,11 +167,11 @@ class Migrator:
         self.analyzer = Analyzer(source_conn, logger=logger,
                                  custom_exclusions=self.custom_exclusions)
         self.reference_resolver = ReferenceResolver(
-            source_conn, dest_conn, migration_db, logger,
+            source_conn, dest_conn, self.migration_db, logger,
             source_conn.domain_dn, dest_conn.domain_dn,
             dry_run=dry_run
         )
-        self.verifier = Verifier(source_conn, dest_conn, migration_db, logger,
+        self.verifier = Verifier(source_conn, dest_conn, self.migration_db, logger,
                                  dry_run=dry_run,
                                  custom_exclusions=self.custom_exclusions)
 
@@ -174,7 +185,7 @@ class Migrator:
                 source_conn, dest_conn, self.attribute_mapper, logger,
                 source_conn.domain, dest_conn.domain,
                 password_mode=password_mode,
-                fixed_password=fixed_password
+                fixed_password=fixed_password, password_length=password_length
             ),
             settings.OBJECT_TYPE_GROUP: GroupHandler(
                 source_conn, dest_conn, self.attribute_mapper, logger,
@@ -186,8 +197,56 @@ class Migrator:
             ),
         }
 
+        self.verifier.handlers = self.handlers
+        self.verifier.reference_resolver = self.reference_resolver
         self.current_run_id = None
         self.cancelled = False
+        self._simulated_ous = set()
+        self._simulated_names = {}
+
+    def _creation_check(self, entry, object_type, dest_dn, planned_ous=None,
+                        reserved_names=None):
+        """Shared preview/execution checks. Never adopt an untracked identity."""
+        from ldap3.utils.conv import escape_filter_chars
+        planned_ous = planned_ous or set()
+        reserved_names = reserved_names if reserved_names is not None else {}
+        if self.dest_conn.get_object_by_dn(dest_dn, attributes=['objectGUID']):
+            return 'conflicts', _('Destination DN already exists and is not tracked')
+        source_parent = DNUtils.get_parent_dn(entry['dn'])
+        parent_dn = DNUtils.get_parent_dn(dest_dn)
+        parent_key = DNUtils.normalize_dn(parent_dn)
+        if parent_key not in planned_ous:
+            mapped_parent = self.migration_db.get_object_by_source_dn(source_parent)
+            if mapped_parent:
+                actual = validate_destination(self.dest_conn, mapped_parent)
+                if DNUtils.normalize_dn(actual) != parent_key:
+                    return 'errors', _('Tracked parent has moved; expected destination path is unavailable')
+            parent = self.dest_conn.get_object_by_dn(parent_dn, attributes=['objectClass'])
+            if not parent:
+                return 'errors', _('Destination parent does not exist: ') + parent_dn
+            classes = parent['attributes'].get('objectClass', [])
+            if isinstance(classes, str):
+                classes = [classes]
+            if not {'organizationalunit', 'container', 'domain', 'domaindns'} & {c.lower() for c in classes}:
+                return 'errors', _('Destination parent is not an OU, container or domain: ') + parent_dn
+        attrs = self.handlers[object_type].prepare_attributes(entry)
+        names = []
+        for attr in ('sAMAccountName', 'userPrincipalName'):
+            value = attrs.get(attr)
+            if not value:
+                continue
+            key = (attr, str(value).casefold())
+            if key in reserved_names:
+                return 'conflicts', _('Duplicate destination identity: ') + attr + '=' + str(value)
+            matches = self.dest_conn.search(base_dn=self.dest_conn.domain_dn,
+                search_filter='(' + attr + '=' + escape_filter_chars(str(value)) + ')',
+                attributes=[attr], scope=ldap3.SUBTREE)
+            if matches:
+                return 'conflicts', _('Destination identity already exists: ') + attr + '=' + str(value)
+            names.append(key)
+        for key in names:
+            reserved_names[key] = dest_dn
+        return 'created', ''
 
     def build_plan(self, analysis: AnalysisResult) -> MigrationPlan:
         """
@@ -213,6 +272,7 @@ class Migrator:
             self.dest_conn.domain_dn
         )
         plan = MigrationPlan(analysis.base_dn, dest_base_dn)
+        plan.unassigned_history = self.migration_db.has_unassigned_history()
         plan.ignored_count = len(analysis.ignored)
         plan.unsupported_count = len(analysis.unsupported)
 
@@ -248,6 +308,10 @@ class Migrator:
             [(o, settings.OBJECT_TYPE_CONTACT) for o in analysis.contacts]
         )
 
+        typed_objects.sort(key=lambda item: (item[1] != settings.OBJECT_TYPE_OU,
+                                               DNUtils.get_depth(item[0]['dn']) if item[1] == settings.OBJECT_TYPE_OU else 0))
+        planned_ous = set()
+        reserved_names = {}
         for entry, object_type in typed_objects:
             source_dn = entry['dn']
             source_guid = entry['attributes'].get('objectGUID')
@@ -259,23 +323,27 @@ class Migrator:
                 plan.errors.append((source_dn, dest_dn, object_type))
                 continue
 
-            if self.migration_db.get_object_by_source_guid(str(source_guid)):
-                plan.exists.append((source_dn, dest_dn, object_type))
+            mapped = self.migration_db.get_object_by_source_guid(str(source_guid))
+            if mapped:
+                try:
+                    actual_dn = validate_destination(self.dest_conn, mapped)
+                    plan.exists.append((source_dn, actual_dn, object_type))
+                except Exception as exc:
+                    plan.errors.append((source_dn, dest_dn, object_type))
+                    plan.issues[source_dn] = str(exc)
                 continue
 
             try:
-                already_there = self.dest_conn.get_object_by_dn(
-                    dest_dn, attributes=['objectGUID'])
-            except Exception as e:
-                # Cannot determine state; surface it rather than promising a create
-                self.logger.warning(f"Could not check {dest_dn}: {e}")
-                plan.errors.append((source_dn, dest_dn, object_type))
-                continue
-
-            if already_there:
-                plan.conflict.append((source_dn, dest_dn, object_type))
-            else:
-                plan.create.append((source_dn, dest_dn, object_type))
+                status, reason = self._creation_check(entry, object_type, dest_dn,
+                                                      planned_ous, reserved_names)
+            except Exception as exc:
+                status, reason = 'errors', str(exc)
+            bucket = {'created': plan.create, 'conflicts': plan.conflict, 'errors': plan.errors}[status]
+            bucket.append((source_dn, dest_dn, object_type))
+            if reason:
+                plan.issues[source_dn] = reason
+            if status == 'created' and object_type == settings.OBJECT_TYPE_OU:
+                planned_ous.add(DNUtils.normalize_dn(dest_dn))
 
         self._plan_references(analysis, plan)
         return plan
@@ -285,11 +353,7 @@ class Migrator:
         Work out which references would be deferred, and which of those could be
         resolved right away because the target is already in the destination.
         """
-        in_scope = set()
-        for bucket in (analysis.organizational_units, analysis.users,
-                       analysis.groups, analysis.contacts):
-            for obj in bucket:
-                in_scope.add(DNUtils.normalize_dn(obj['dn']))
+        planned_targets = {DNUtils.normalize_dn(src) for src, _, _ in plan.create + plan.exists}
 
         reference_attrs = (settings.ATTR_MEMBER, settings.ATTR_MANAGER,
                            settings.ATTR_MANAGED_BY)
@@ -309,67 +373,17 @@ class Migrator:
                     for ref_dn in values:
                         if not ref_dn:
                             continue
-                        if DNUtils.normalize_dn(str(ref_dn)) in in_scope:
-                            continue  # migrated in this same run
-
-                        # Outside the scope: deferred. Resolvable now only if the
-                        # target has already been migrated by an earlier run.
-                        mapped = self.migration_db.get_object_by_source_dn(str(ref_dn))
-                        resolvable = bool(mapped and mapped.get('dest_dn'))
-
-                        # If not in the database, check whether the object exists in
-                        # the destination anyway (migrated before a DB reset, or
-                        # manually created). Match by sAMAccountName.
+                        if DNUtils.normalize_dn(str(ref_dn)) in planned_targets:
+                            continue
+                        try:
+                            resolvable = bool(self.reference_resolver.resolve_reference(str(ref_dn), update_mapping=False))
+                            reason = _('No verified mapping. Matching account names are not used automatically.')
+                        except Exception as exc:
+                            resolvable = False
+                            reason = str(exc)
+                        plan.deferred.append((obj['dn'], attr, str(ref_dn), resolvable))
                         if not resolvable:
-                            resolvable = self._reference_exists_in_destination(str(ref_dn))
-
-                        plan.deferred.append(
-                            (obj['dn'], attr, str(ref_dn), resolvable))
-
-    def _reference_exists_in_destination(self, source_dn: str) -> bool:
-        """
-        Check whether a reference target exists in the destination domain.
-
-        Used during plan generation when the target is not in migration_map but
-        might still exist (migrated before a database reset, or manually created).
-
-        Args:
-            source_dn: DN of the referenced object in the source domain
-
-        Returns:
-            True if the object exists in the destination domain
-        """
-        try:
-            source_obj = self.source_conn.get_object_by_dn(
-                source_dn, attributes=['sAMAccountName'])
-            if not source_obj:
-                return False
-
-            sam = source_obj['attributes'].get('sAMAccountName')
-            if not sam:
-                return False
-
-            # Search the destination domain by sAMAccountName
-            dest_entries = self.dest_conn.search(
-                base_dn=self.dest_conn.domain_dn,
-                search_filter=f'(sAMAccountName={sam})',
-                scope=ldap3.SUBTREE,
-                attributes=['sAMAccountName']
-            )
-            # The filter might not be enforced by test doubles; verify explicitly.
-            for entry in dest_entries:
-                entry_sam = entry.get('attributes', {}).get('sAMAccountName')
-                if entry_sam == sam:
-                    self.logger.debug(
-                        f"Reference target {source_dn} found in destination "
-                        f"(not in migration_map; possibly migrated before DB reset)")
-                    return True
-
-        except Exception as e:
-            self.logger.debug(
-                f"Could not check destination for reference target {source_dn}: {e}")
-
-        return False
+                            plan.reference_issues[(obj['dn'], attr, str(ref_dn))] = reason
 
     def migrate(self, base_dn: str) -> MigrationResult:
         """
@@ -393,6 +407,9 @@ class Migrator:
             self.logger.info(f"Source Base DN: {base_dn}")
             self.logger.info(f"Dry Run Mode: {self.dry_run}")
 
+            self._simulated_ous.clear()
+            self._simulated_names.clear()
+
             # Phase 0: Analysis
             self._update_progress(0, "Analyzing source domain...")
             result.analysis_result = self._phase_analysis(base_dn)
@@ -400,60 +417,93 @@ class Migrator:
 
             if result.objects_analyzed == 0:
                 self.logger.warning("No objects found to migrate")
-                result.success = True
+                self._finish_result(result)
                 return result
 
-            # Phase 1: Create OUs
-            self._update_progress(20, "Creating organizational units...")
-            phase1_result = self._phase1_create_ous(result.analysis_result)
-            result.phase_results['phase1_ous'] = phase1_result
-
-            # Phase 2: Create Objects (Users, Groups, Contacts)
-            self._update_progress(40, "Creating objects...")
-            phase2_result = self._phase2_create_objects(result.analysis_result)
-            result.phase_results['phase2_objects'] = phase2_result
-
-            # Phase 3: Copy Attributes
-            self._update_progress(60, "Copying attributes...")
-            phase3_result = self._phase3_copy_attributes(result.analysis_result)
-            result.phase_results['phase3_attributes'] = phase3_result
-
-            # Phase 4: Resolve References
-            self._update_progress(80, "Resolving references...")
-            phase4_result = self._phase4_resolve_references(result.analysis_result)
-            result.phase_results['phase4_references'] = phase4_result
-
-            # Phase 5: Verification
-            self._update_progress(95, "Verifying results...")
-            result.verification_result = self._phase5_verify(base_dn)
-
-            # Calculate final statistics
-            self._calculate_statistics(result)
-
-            # Mark run as completed
-            result.success = not self.cancelled
-            result.end_time = datetime.now()
-            result.duration_seconds = int((result.end_time - result.start_time).total_seconds())
-
-            self._complete_migration_run(result)
-
-            self._update_progress(100, "Migration complete!")
-            self.logger.info(f"=== Migration Run {self.current_run_id} Completed ===")
-
-        except Exception as e:
-            self.logger.critical(f"Migration failed with error: {e}")
-            result.success = False
-            result.errors_count += 1
-
-            if self.current_run_id:
-                self.migration_db.update_migration_run(
-                    self.current_run_id,
-                    status=settings.RUN_STATUS_FAILED
-                )
-
-            raise
+            phases = [
+                (20, 'Creating organizational units...', 'phase1_ous', self._phase1_create_ous),
+                (40, 'Creating objects...', 'phase2_objects', self._phase2_create_objects),
+                (60, 'Copying attributes...', 'phase3_attributes', self._phase3_copy_attributes),
+                (80, 'Resolving references...', 'phase4_references', self._phase4_resolve_references),
+            ]
+            for percent, message, key, phase in phases:
+                if self.cancelled:
+                    break
+                self._update_progress(percent, message)
+                result.phase_results[key] = phase(result.analysis_result)
+            if not self.cancelled:
+                self._update_progress(95, 'Verifying results...')
+                result.verification_result = self._phase5_verify(base_dn)
+            self._finish_result(result)
+        except Exception as exc:
+            self.logger.critical(f'Migration failed with error: {exc}')
+            result.failure_message = str(exc)
+            self._finish_result(result, fatal=True)
 
         return result
+
+    def _finish_result(self, result: MigrationResult, fatal: bool = False):
+        """Use the same outcome for the worker, database, GUI and reports."""
+        self._calculate_statistics(result)
+        verification = result.verification_result
+        if verification:
+            result.warnings.extend(verification.warnings)
+            if not verification.success or verification.errors:
+                result.errors_count += max(1, len(verification.errors))
+        if result.run_id:
+            if verification:
+                for message in verification.errors:
+                    self.migration_db.log_error(
+                        result.run_id, settings.SEVERITY_ERROR,
+                        settings.PHASE_VERIFICATION, message)
+                for message in verification.warnings:
+                    self.migration_db.log_error(result.run_id, settings.SEVERITY_WARNING,
+                                                settings.PHASE_VERIFICATION, message)
+                self.migration_db.log_error(result.run_id, settings.SEVERITY_INFO,
+                    settings.PHASE_VERIFICATION,
+                    f"Verification checked {verification.checked_objects} objects, "
+                    f"{verification.checked_attributes} attributes, "
+                    f"{verification.checked_references} reference attributes"
+                    + (' (skipped: Dry Run)' if self.dry_run else ''))
+            if fatal:
+                self.migration_db.log_error(
+                    result.run_id, settings.SEVERITY_CRITICAL,
+                    'migration', result.failure_message)
+            logged_errors = self.migration_db.get_errors(result.run_id)
+            # Object errors already appear in phase counters; reference errors
+            # are logged independently and must not disappear from the result.
+            result.errors_count += sum(
+                e['severity'] in (settings.SEVERITY_ERROR, settings.SEVERITY_CRITICAL)
+                and e['phase'] in (settings.PHASE_REFERENCES, settings.PHASE_PASSWORD) for e in logged_errors)
+            result.warnings.extend(e['error_message'] for e in logged_errors
+                                   if e['phase'] == settings.PHASE_PASSWORD and e['severity'] == settings.SEVERITY_WARNING)
+            if self.migration_db.get_unresolved_references():
+                result.warnings.append('Unresolved references remain')
+        if self.migration_db.has_unassigned_history():
+            result.warnings.append(_('Some legacy history could not be assigned to a domain pair and is not used'))
+        if result.objects_conflicted:
+            result.warnings.append(f'{result.objects_conflicted} object conflicts')
+        if fatal:
+            result.errors_count += 1
+            result.status = settings.RUN_STATUS_FAILED
+        elif self.cancelled:
+            result.status = settings.RUN_STATUS_CANCELLED
+        elif result.errors_count:
+            result.status = settings.RUN_STATUS_COMPLETED_WITH_ERRORS
+        elif result.warnings:
+            result.status = settings.RUN_STATUS_COMPLETED_WITH_WARNINGS
+        else:
+            result.status = settings.RUN_STATUS_COMPLETED
+        result.success = result.status in (
+            settings.RUN_STATUS_COMPLETED, settings.RUN_STATUS_COMPLETED_WITH_WARNINGS)
+        result.end_time = datetime.now()
+        result.duration_seconds = int((result.end_time - result.start_time).total_seconds())
+        if result.run_id:
+            self._complete_migration_run(result)
+        if result.status in (settings.RUN_STATUS_COMPLETED, settings.RUN_STATUS_COMPLETED_WITH_ERRORS,
+                              settings.RUN_STATUS_COMPLETED_WITH_WARNINGS):
+            self._update_progress(100, result.status)
+        self.logger.info(f'Migration finished: {result.status}; errors={result.errors_count}')
 
     def cancel(self):
         """Cancel migration"""
@@ -502,15 +552,15 @@ class Migrator:
             'errors_count': result.errors_count,
         }
 
-        status = settings.RUN_STATUS_COMPLETED if result.success else settings.RUN_STATUS_FAILED
-        if self.cancelled:
-            status = settings.RUN_STATUS_CANCELLED
+        status = result.status
 
         self.migration_db.update_migration_run(
             self.current_run_id,
             status=status,
             stats=stats,
-            duration_seconds=result.duration_seconds
+            duration_seconds=result.duration_seconds,
+            notes='\n'.join(filter(None, [result.failure_message] + result.warnings +
+                         (result.verification_result.errors if result.verification_result else [])))
         )
 
     def _phase_analysis(self, base_dn: str) -> AnalysisResult:
@@ -680,20 +730,27 @@ class Migrator:
         map_entry = self.migration_db.get_object_by_source_guid(source_guid)
 
         if map_entry:
-            # Already migrated
-            self.logger.debug(f"{source_dn} - EXISTS")
-
-            # Refresh last_seen so the row reflects this run
-            self.migration_db.add_object(
-                source_guid=source_guid,
-                source_dn=source_dn,
-                dest_guid=map_entry.get('dest_guid'),
-                dest_dn=map_entry.get('dest_dn'),
-                object_type=object_type,
-                status=settings.STATUS_EXISTS,
-                run_id=self.current_run_id
-            )
-
+            try:
+                actual_dn = validate_destination(self.dest_conn, map_entry)
+            except Exception as exc:
+                self.logger.error(f'Invalid tracked object {source_dn}: {exc}')
+                self.migration_db.log_error(self.current_run_id, settings.SEVERITY_ERROR,
+                    settings.PHASE_OBJECT_CREATION, str(exc), object_dn=source_dn,
+                    object_type=object_type)
+                return 'errors'
+            pending_password = map_entry.get('error_message') == 'PASSWORD_SETUP_PENDING'
+            if not self.dry_run:
+                if pending_password and object_type == settings.OBJECT_TYPE_USER:
+                    handler.configure_password(source_entry, actual_dn)
+                    self._record_password_events(handler, source_dn)
+                    pending_password = handler.password_failed
+                self.migration_db.refresh_mapping(source_guid, source_dn, actual_dn)
+                self.migration_db.add_object(
+                    source_guid=source_guid, source_dn=source_dn,
+                    dest_guid=map_entry['dest_guid'], dest_dn=actual_dn,
+                    object_type=object_type, status=settings.STATUS_EXISTS,
+                    error_message='PASSWORD_SETUP_PENDING' if pending_password else None,
+                    run_id=self.current_run_id)
             return 'exists'
 
         # Convert DN to destination
@@ -703,27 +760,33 @@ class Migrator:
             self.dest_conn.domain_dn
         )
 
-        # Check if object exists in destination (but not tracked)
-        existing = self.dest_conn.get_object_by_dn(dest_dn, attributes=['objectGUID'])
-        if existing:
-            # CONFLICT
-            self.logger.conflict(f"{source_dn} - CONFLICT (exists but not tracked)")
-            self.migration_db.add_conflict(
-                source_dn, dest_dn,
-                settings.CONFLICT_TYPE_EXISTS_NOT_TRACKED,
-                self.current_run_id,
-                object_type=object_type,
-                notes="Object present in destination but absent from migration_map; not overwritten"
-            )
-            return 'conflicts'
-
-        # Create object
+        try:
+            status, reason = self._creation_check(source_entry, object_type, dest_dn,
+                self._simulated_ous if self.dry_run else None,
+                self._simulated_names if self.dry_run else None)
+        except Exception as exc:
+            status, reason = 'errors', str(exc)
+        if status == 'conflicts':
+            self.logger.conflict(f"{source_dn} - CONFLICT ({reason})")
+            self.migration_db.add_conflict(source_dn, dest_dn,
+                settings.CONFLICT_TYPE_EXISTS_NOT_TRACKED, self.current_run_id,
+                object_type=object_type, notes=reason)
+            return status
+        if status == 'errors':
+            self.logger.error(f"Cannot create {dest_dn}: {reason}")
+            self.migration_db.log_error(self.current_run_id, settings.SEVERITY_ERROR,
+                settings.PHASE_OBJECT_CREATION, reason, object_dn=source_dn,
+                object_type=object_type)
+            return status
         if self.dry_run:
+            if object_type == settings.OBJECT_TYPE_OU:
+                self._simulated_ous.add(DNUtils.normalize_dn(dest_dn))
             self.logger.info(f"[DRY RUN] Would create: {dest_dn}")
             return 'created'
 
         try:
             success = handler.create(source_entry, dest_dn)
+            self._record_password_events(handler, source_dn)
 
             if success:
                 # Get destination GUID
@@ -739,11 +802,12 @@ class Migrator:
                     dest_dn=dest_dn,
                     object_type=object_type,
                     status=settings.STATUS_CREATED,
+                    error_message='PASSWORD_SETUP_PENDING' if getattr(handler, 'password_failed', False) else None,
                     run_id=self.current_run_id
                 )
 
                 # Handle references
-                if object_type in [settings.OBJECT_TYPE_GROUP, settings.OBJECT_TYPE_USER]:
+                if handler.get_reference_attributes():
                     self._handle_references(source_entry, source_guid, dest_dn, object_type, handler)
 
                 return 'created'
@@ -761,6 +825,11 @@ class Migrator:
                 object_type=object_type
             )
             return 'errors'
+
+    def _record_password_events(self, handler, source_dn):
+        for severity, message in getattr(handler, 'password_events', []):
+            self.migration_db.log_error(self.current_run_id, severity, settings.PHASE_PASSWORD,
+                                        message, object_dn=source_dn, object_type='user')
 
     def _handle_references(self, source_entry, source_guid, dest_dn, object_type, handler):
         """Handle reference attributes for an object"""

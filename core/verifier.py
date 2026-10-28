@@ -11,6 +11,10 @@ from utils.logger import MigrationLogger
 from utils.dn_utils import DNUtils
 from config import settings
 import ldap3
+from datetime import datetime, timezone
+from core.analyzer import Analyzer
+from core.identity import guid_text, validate_destination
+
 
 
 @dataclass
@@ -24,6 +28,11 @@ class VerificationResult:
     source_counts: Dict[str, int] = field(default_factory=dict)
     dest_counts: Dict[str, int] = field(default_factory=dict)
     migration_counts: Dict[str, int] = field(default_factory=dict)
+
+    checked_objects: int = 0
+    checked_attributes: int = 0
+    checked_references: int = 0
+    findings: List[Dict[str, Any]] = field(default_factory=list)
 
     # Deferred references
     total_deferred: int = 0
@@ -46,7 +55,7 @@ class VerificationResult:
 class Verifier:
     """
     Verifies migration results
-    Checks object counts, deferred references, and migration completeness
+    Checks GUID identities, prepared attribute values and reference membership
     """
 
     def __init__(
@@ -79,6 +88,8 @@ class Verifier:
         self.dry_run = dry_run
         self.custom_exclusions = list(custom_exclusions or [])
         self.ignore_rules = None
+        self.handlers = None
+        self.reference_resolver = None
 
     def verify(self, base_dn: str, run_id: int) -> VerificationResult:
         """
@@ -110,7 +121,13 @@ class Verifier:
         self.logger.info("Starting verification...")
 
         # Count objects in source
-        result.source_counts = self._count_objects(self.source_conn, base_dn, is_source=True)
+        try:
+            analysis = Analyzer(self.source_conn, custom_exclusions=self.custom_exclusions).analyze(base_dn)
+            result.source_counts = {kind: analysis.counts_by_type[kind]
+                                    for kind in ('ou', 'user', 'group', 'contact')}
+        except Exception as exc:
+            result.add_error(f'Cannot verify source: {exc}')
+            return result
         self.logger.info(f"Source counts: {result.source_counts}")
 
         # Count objects in destination. DNUtils handles the case-insensitive
@@ -120,7 +137,11 @@ class Verifier:
             self.source_conn.domain_dn,
             self.dest_conn.domain_dn
         )
-        result.dest_counts = self._count_objects(self.dest_conn, dest_base_dn, is_source=False)
+        try:
+            result.dest_counts = self._count_objects(self.dest_conn, dest_base_dn, is_source=False)
+        except Exception as exc:
+            result.add_error(f'Cannot verify destination: {exc}')
+            return result
         self.logger.info(f"Destination counts: {result.dest_counts}")
 
         # Get migration statistics from database
@@ -144,8 +165,10 @@ class Verifier:
             if unresolved > 0:
                 result.add_warning(f"{unresolved} deferred references remain unresolved")
 
-        # Compare counts
-        self._compare_counts(result)
+        # Counts are informational: unrelated entries cannot compensate for a
+        # missing identity, and a tracked object may have moved outside this subtree.
+        self._include_reference_parents(analysis, run_id, result)
+        self._verify_objects(analysis, result)
 
         # Check for errors in migration_errors table
         errors = self.migration_db.get_errors(run_id, severity=settings.SEVERITY_ERROR)
@@ -162,6 +185,179 @@ class Verifier:
             self.logger.warning(f"Verification completed with {len(result.warnings)} warnings")
 
         return result
+
+    def _include_reference_parents(self, analysis, run_id, result):
+        buckets = {'ou': analysis.organizational_units, 'user': analysis.users,
+                   'group': analysis.groups, 'contact': analysis.contacts}
+        seen = set()
+        for entries in buckets.values():
+            for entry in entries:
+                try:
+                    seen.add(guid_text(entry['attributes'].get('objectGUID')))
+                except Exception:
+                    # The individual-object check reports this without aborting
+                    # verification of every other object.
+                    pass
+        for parent_guid in self.migration_db.get_reference_parents_for_run(run_id):
+            try:
+                guid = guid_text(parent_guid)
+                if guid in seen:
+                    continue
+                mapped = self.migration_db.get_object_by_source_guid(guid)
+                source = self.source_conn.get_object_by_guid(guid, base_dn=self.source_conn.domain_dn)
+                if not mapped or not source or guid_text(source['attributes'].get('objectGUID')) != guid:
+                    raise ValueError('Reference parent identity could not be verified')
+                buckets[mapped['object_type']].append(source)
+                seen.add(guid)
+            except Exception as exc:
+                self._finding(result, 'Reference parent verification failed', str(parent_guid), detail=str(exc))
+
+    def _components(self):
+        if self.handlers is not None and self.reference_resolver is not None:
+            return
+        from core.attribute_mapper import AttributeMapper
+        from core.object_handlers.ou_handler import OUHandler
+        from core.object_handlers.user_handler import UserHandler
+        from core.object_handlers.group_handler import GroupHandler
+        from core.object_handlers.contact_handler import ContactHandler
+        from core.reference_resolver import ReferenceResolver
+        mapper = AttributeMapper()
+        self.handlers = {kind: cls(self.source_conn, self.dest_conn, mapper, self.logger,
+                                  self.source_conn.domain, self.dest_conn.domain)
+                         for kind, cls in [('ou', OUHandler), ('user', UserHandler),
+                                           ('group', GroupHandler), ('contact', ContactHandler)]}
+        self.reference_resolver = ReferenceResolver(self.source_conn, self.dest_conn,
+            self.migration_db, self.logger, self.source_conn.domain_dn, self.dest_conn.domain_dn,
+            dry_run=True)
+
+    @staticmethod
+    def _values(value):
+        if value is None or value == '':
+            return []
+        return list(value) if isinstance(value, (list, tuple, set)) else [value]
+
+    @classmethod
+    def _normalized(cls, value, attribute, reference=False):
+        values = set()
+        for item in cls._values(value):
+            if reference:
+                item = DNUtils.normalize_dn(str(item))
+            elif attribute.lower() == 'accountexpires':
+                item = int(item)
+                if item in (0, 9223372036854775807):
+                    item = 'never-expires'
+            elif attribute.lower() in ('grouptype', 'primarygroupid', 'useraccountcontrol'):
+                item = int(item)
+                if attribute.lower() == 'grouptype':
+                    item &= 0xffffffff
+                elif attribute.lower() == 'useraccountcontrol':
+                    # Account-disable and normal-account bits are set by this app.
+                    # Other server-maintained flags need not equal the create value.
+                    item &= 0x202
+            elif isinstance(item, datetime):
+                item = item.astimezone(timezone.utc).isoformat() if item.tzinfo else item.isoformat()
+            elif isinstance(item, (bytearray, memoryview)):
+                item = bytes(item)
+            values.add(item)
+        return values
+
+    @staticmethod
+    def _finding(result, kind, source_dn, dest_dn='', attribute='',
+                 expected=None, actual=None, detail='', warning=False):
+        record = dict(kind=kind, source_dn=source_dn, dest_dn=dest_dn,
+                      attribute=attribute, expected=expected, actual=actual, detail=detail,
+                      severity='warning' if warning else 'error')
+        result.findings.append(record)
+        message = f"{kind}: {source_dn} -> {dest_dn}"
+        if attribute:
+            message += f" [{attribute}] expected={expected!r}; actual={actual!r}"
+        if detail:
+            message += f"; {detail}"
+        (result.add_warning if warning else result.add_error)(message)
+
+    def _verify_objects(self, analysis, result):
+        self._components()
+        pending = self.migration_db.get_unresolved_references()
+        for kind, entries in [('ou', analysis.organizational_units), ('user', analysis.users),
+                              ('group', analysis.groups), ('contact', analysis.contacts)]:
+            for source in entries:
+                source_dn = source['dn']
+                dest_dn = ''
+                try:
+                    source_guid = guid_text(source['attributes'].get('objectGUID'))
+                    mapped = self.migration_db.get_object_by_source_guid(source_guid)
+                    if not mapped:
+                        result.missing_objects.append(source_dn)
+                        self._finding(result, 'Unverified object', source_dn,
+                                      detail='No tracked GUID mapping for this domain pair')
+                        continue
+                    if mapped['object_type'] != kind:
+                        raise ValueError('Source object class differs from the tracked type')
+                    dest_dn = validate_destination(self.dest_conn, mapped)
+                    handler = self.handlers[kind]
+                    expected = handler.prepare_attributes(source)
+                    if kind == 'user':
+                        expected['primaryGroupID'] = settings.PRIMARY_GROUP_ID
+                    # Never inspect or report credentials, even with custom mappings.
+                    excluded = {'unicodepwd', 'userpassword', 'supplementalcredentials',
+                                'ntpwdhistory', 'lmpwdhistory'}
+                    expected = {k: v for k, v in expected.items() if k.lower() not in excluded}
+                    refs = handler.get_reference_attributes()
+                    target = self.dest_conn.get_object_by_dn(dest_dn,
+                        attributes=list(set(expected) | set(refs) | {'objectGUID', 'objectClass'}))
+                    if not target or guid_text(target['attributes'].get('objectGUID')) != guid_text(mapped['dest_guid']):
+                        raise ValueError('Destination disappeared or changed during verification')
+                    actual = {key.lower(): value for key, value in target['attributes'].items()}
+                    result.checked_objects += 1
+                    for attr, value in expected.items():
+                        result.checked_attributes += 1
+                        if self._normalized(value, attr) != self._normalized(actual.get(attr.lower()), attr):
+                            self._finding(result, 'Attribute mismatch', source_dn, dest_dn,
+                                          attr, value, actual.get(attr.lower()))
+                    self._verify_references(source, source_guid, dest_dn, actual, refs, pending, result)
+                except Exception as exc:
+                    self._finding(result, 'Object verification failed', source_dn, dest_dn, detail=str(exc))
+
+    def _verify_references(self, source, source_guid, dest_dn, actual, refs, pending, result):
+        source_attrs = {key.lower(): value for key, value in source['attributes'].items()}
+        for attr in refs:
+            name = attr.lower()
+            # A ranged response is not a complete membership list. Fail explicitly
+            # unless ldap3 has already expanded it to the ordinary attribute.
+            if any(key.startswith(name + ';range=') for key in set(source_attrs) | set(actual)):
+                self._finding(result, 'Incomplete reference read', source['dn'], dest_dn,
+                              detail=f'{attr}: ranged values were not fully expanded')
+                continue
+            expected_dns = set()
+            for ref_dn in self._values(source_attrs.get(name)):
+                ref_dn = str(ref_dn)
+                if self.reference_resolver.is_builtin_target(ref_dn):
+                    continue
+                try:
+                    mapped_dn = self.reference_resolver.resolve_reference(ref_dn, update_mapping=False)
+                except Exception as exc:
+                    self._finding(result, 'Reference identity failed', source['dn'], dest_dn,
+                                  detail=f'{attr}: {ref_dn}: {exc}')
+                    continue
+                if mapped_dn:
+                    expected_dns.add(DNUtils.normalize_dn(mapped_dn))
+                else:
+                    deferred = any(guid_text(row['parent_object_guid']) == source_guid
+                                   and row['attribute_name'].lower() == name
+                                   and DNUtils.normalize_dn(row['referenced_source_dn']) == DNUtils.normalize_dn(ref_dn)
+                                   for row in pending)
+                    self._finding(result, 'Deferred reference' if deferred else 'Untracked reference',
+                                  source['dn'], dest_dn, detail=f'{attr}: {ref_dn}', warning=deferred)
+            actual_dns = self._normalized(actual.get(name), attr, reference=True)
+            result.checked_references += 1
+            missing = expected_dns - actual_dns
+            extra = actual_dns - expected_dns
+            if missing:
+                self._finding(result, 'Missing reference values', source['dn'], dest_dn,
+                              attr, sorted(missing), sorted(actual_dns))
+            if extra:
+                self._finding(result, 'Unexpected reference values', source['dn'], dest_dn,
+                              attr, sorted(expected_dns), sorted(extra))
 
     def _count_objects(
         self,
@@ -210,7 +406,7 @@ class Verifier:
                 self.logger.debug(f"Base DN not present, counting as empty: {base_dn}")
                 return counts
             self.logger.error(f"Failed to count objects in {base_dn}: {e}")
-            return counts
+            raise
 
         for entry in entries:
             object_classes = entry['attributes'].get('objectClass', [])
@@ -254,31 +450,6 @@ class Verifier:
         rules = self.ignore_rules or IgnoreRules(base_dn=None)
         return rules.should_ignore(dn, object_classes, attributes)
 
-    def _compare_counts(self, result: VerificationResult):
-        """
-        Compare source and destination counts
-
-        Args:
-            result: VerificationResult to update
-        """
-        for obj_type in [settings.OBJECT_TYPE_OU, settings.OBJECT_TYPE_USER,
-                         settings.OBJECT_TYPE_GROUP, settings.OBJECT_TYPE_CONTACT]:
-            source_count = result.source_counts.get(obj_type, 0)
-            dest_count = result.dest_counts.get(obj_type, 0)
-
-            if dest_count < source_count:
-                diff = source_count - dest_count
-                result.add_warning(
-                    f"{obj_type}: {diff} objects in source not found in destination "
-                    f"(source: {source_count}, dest: {dest_count})"
-                )
-            elif dest_count > source_count:
-                diff = dest_count - source_count
-                result.add_warning(
-                    f"{obj_type}: {diff} extra objects in destination "
-                    f"(source: {source_count}, dest: {dest_count})"
-                )
-
     def verify_object(
         self,
         source_dn: str,
@@ -286,44 +457,46 @@ class Verifier:
         check_attributes: Optional[List[str]] = None
     ) -> bool:
         """
-        Verify a single object exists and has expected attributes
+        Verify one tracked object using the full migration contract
 
         Args:
             source_dn: Source DN
             dest_dn: Destination DN
-            check_attributes: Optional list of attributes to verify
+            check_attributes: Optional attributes that must belong to the migration contract
 
         Returns:
             True if verification passes
         """
+        from core.analyzer import AnalysisResult
         try:
-            # Check if destination object exists
-            dest_obj = self.dest_conn.get_object_by_dn(dest_dn)
-            if not dest_obj:
-                self.logger.error(f"Object not found in destination: {dest_dn}")
+            source = self.source_conn.get_object_by_dn(source_dn)
+            if not source:
                 return False
-
-            # Optionally check specific attributes
+            guid = guid_text(source['attributes'].get('objectGUID'))
+            mapped = self.migration_db.get_object_by_source_guid(guid)
+            if not mapped or DNUtils.normalize_dn(validate_destination(self.dest_conn, mapped)) != DNUtils.normalize_dn(dest_dn):
+                return False
+            analysis = AnalysisResult(base_dn=source_dn)
+            buckets = {'ou': analysis.organizational_units, 'user': analysis.users,
+                       'group': analysis.groups, 'contact': analysis.contacts}
+            buckets[mapped['object_type']].append(source)
+            result = VerificationResult()
+            self._verify_objects(analysis, result)
             if check_attributes:
-                dest_attrs = dest_obj.get('attributes', {})
-                missing = [attr for attr in check_attributes if attr not in dest_attrs]
-
-                if missing:
-                    self.logger.warning(
-                        f"Missing attributes on {dest_dn}: {', '.join(missing)}"
-                    )
+                self._components()
+                expected = self.handlers[mapped['object_type']].prepare_attributes(source)
+                # This convenience API only accepts attributes in the migration contract.
+                if not set(check_attributes) <= set(expected):
                     return False
-
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Verification failed for {dest_dn}: {e}")
+            return result.success
+        except Exception as exc:
+            self.logger.error(f"Verification failed for {dest_dn}: {exc}")
             return False
 
 
 if __name__ == "__main__":
     print("=== Verifier Test ===\n")
     print("Verifies migration results:")
-    print("- Compares object counts between source and destination")
+    print("- Verifies GUID identities, transformed attributes and direct reference values")
     print("- Checks deferred references status")
     print("- Reports errors and warnings")

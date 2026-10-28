@@ -13,7 +13,7 @@ from PyQt5.QtGui import QIcon, QTextCursor
 from gui.connection_dialog import ConnectionDialog
 from gui.branch_dialog import BranchDialog
 from gui.preview_dialog import PreviewDialog
-from gui.progress_window import ProgressWindow
+from gui.progress_window import ProgressWindow, completion_title
 
 from core.ldap_connector import LDAPConnector, LDAPConnectionError
 from core.migrator import Migrator, MigrationResult
@@ -580,6 +580,7 @@ class MainWindow(QMainWindow):
             logger=self.logger or MigrationLogger(gui_callback=self._append_log),
             password_mode=migration_opts.get('password_mode', settings.DEFAULT_PASSWORD_MODE),
             fixed_password=migration_opts.get('fixed_password', ''),
+            password_length=migration_opts.get('password_length', settings.DEFAULT_PASSWORD_LENGTH),
             batch_size=migration_opts.get('batch_size', settings.DEFAULT_BATCH_SIZE),
             dry_run=True,  # planning only
             custom_exclusions=self.config_manager.get_custom_exclusions(),
@@ -733,6 +734,7 @@ class MainWindow(QMainWindow):
                 logger=self.logger,
                 password_mode=migration_opts.get('password_mode', settings.DEFAULT_PASSWORD_MODE),
                 fixed_password=migration_opts.get('fixed_password', ''),
+                password_length=migration_opts.get('password_length', settings.DEFAULT_PASSWORD_LENGTH),
                 batch_size=migration_opts.get('batch_size', settings.DEFAULT_BATCH_SIZE),
                 dry_run=self.dry_run_checkbox.isChecked(),
                 progress_callback=self.migration_worker.emit_progress,
@@ -763,23 +765,22 @@ class MainWindow(QMainWindow):
             self.last_run_id = result.run_id
             self.report_btn.setEnabled(True)
 
-        if success and result is not None:
-            message = (
-                f"Migration completed successfully. "
-                f"Created: {result.objects_created}, "
-                f"Skipped: {result.objects_skipped}, "
-                f"Conflicts: {result.objects_conflicted}, "
-                f"Errors: {result.errors_count}"
-            )
-            progress_window.set_complete(True, message)
-            self.statusBar.showMessage(_("Migration completed successfully"))
-        else:
-            if progress_window.is_cancelled():
-                message = _("Migration cancelled")
-            else:
-                message = _("Migration failed")
-            progress_window.set_complete(False, message)
-            self.statusBar.showMessage(message)
+        status = result.status if result is not None else settings.RUN_STATUS_FAILED
+        if result is None and progress_window.is_cancelled():
+            status = settings.RUN_STATUS_CANCELLED
+        message = completion_title(status)
+        if result is not None:
+            message += '\n' + _("Created: {created}; skipped: {skipped}; conflicts: {conflicts}; errors: {errors}").format(
+                created=result.objects_created, skipped=result.objects_skipped,
+                conflicts=result.objects_conflicted, errors=result.errors_count)
+            if result.failure_message:
+                message += '\n' + result.failure_message
+            if result.verification_result:
+                message += ''.join('\n' + error for error in result.verification_result.errors)
+            if result.warnings:
+                message += ''.join('\n' + warning for warning in result.warnings)
+        progress_window.set_complete(success, message, status=status)
+        self.statusBar.showMessage(completion_title(status))
 
         # The analysis and plan reflect pre-migration state; force a fresh pass
         # before any subsequent run so nothing stale is reused.

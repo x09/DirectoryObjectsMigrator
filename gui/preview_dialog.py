@@ -78,7 +78,7 @@ class PreviewDialog(QDialog):
 
         self.tabs = QTabWidget()
         self.plan_table = self._make_table(
-            [_("Action"), _("Type"), _("Source DN"), _("Destination DN")])
+            [_("Action"), _("Type"), _("Source DN"), _("Destination DN"), _("Reason")])
         self.tabs.addTab(self._wrap(self.plan_table), _("Planned actions"))
 
         self.deferred_table = self._make_table(
@@ -180,7 +180,7 @@ class PreviewDialog(QDialog):
         self.plan_table.setRowCount(len(rows))
         for row, (action, color, (source_dn, dest_dn, object_type)) in enumerate(rows):
             cells = [_(action), _(TYPE_LABELS.get(object_type, object_type)),
-                     source_dn, dest_dn]
+                     source_dn, dest_dn, self.plan.issues.get(source_dn, '')]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if col == 0:
@@ -203,7 +203,7 @@ class PreviewDialog(QDialog):
         self.deferred_table.setRowCount(len(truly_deferred))
 
         for row, (parent_dn, attr, ref_dn, resolvable) in enumerate(truly_deferred):
-            status = _("Target not migrated yet")
+            status = self.plan.reference_issues.get((parent_dn, attr, ref_dn), _("Target not migrated yet"))
             cells = [parent_dn, attr, ref_dn, status]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
@@ -239,6 +239,10 @@ class PreviewDialog(QDialog):
     def _populate_notes(self):
         s = self.plan.summary()
         notes = []
+        if self.plan.unassigned_history:
+            notes.append(_("Some legacy history has no reliable domain pair and is not used. Restore a verified database backup or review the old history before proceeding."))
+        if self.plan.reference_issues:
+            notes.append(_("References require a verified GUID mapping. Matching logins alone are never used; see the Deferred references tab."))
 
         if s['conflict']:
             notes.append(
@@ -249,14 +253,13 @@ class PreviewDialog(QDialog):
         if s['errors']:
             notes.append(
                 f"<b style='color:#C62828;'>{s['errors']} {_('ERROR')}</b>: " +
-                _("could not be classified (missing objectGUID or unreadable "
-                  "destination). They will be skipped and logged."))
+                _("Identity could not be verified. Missing, replaced or unreadable tracked objects are skipped; see the Reason column."))
 
         if s['deferred']:
             resolvable = s['deferred_resolvable_now']
             notes.append(
                 f"<b style='color:#EF6C00;'>{s['deferred']} {_('DEFERRED')}</b>: " +
-                _("references pointing outside the migration scope.") +
+                _("references without a usable target in the current plan.") +
                 f" {resolvable} " + _("can be added now; the rest need their target "
                                       "migrated first, then re-run this DN."))
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 # Application metadata
 APP_NAME = "DirectoryObjectsMigrator"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 APP_AUTHOR = "Anton"
 APP_DESCRIPTION = "Active Directory to Samba AD Migration Tool"
 
@@ -35,6 +35,14 @@ DEFAULT_TIMEOUT = 30  # seconds
 DEFAULT_BATCH_SIZE = 100
 
 # Password policy defaults
+DEFAULT_PASSWORD_POLICY = {
+    'complexity': True, 'store_plaintext': False, 'history_length': 24,
+    'minimum_length': 7, 'minimum_age_days': 1, 'maximum_age_days': 42,
+    'lockout_duration_minutes': 30, 'lockout_threshold': 0,
+    'reset_lockout_after_minutes': 30,
+}
+PASSWORD_RANDOM_RETRIES = 3
+PHASE_PASSWORD = "password"
 DEFAULT_PASSWORD_LENGTH = 12
 DEFAULT_PASSWORD_CHARSET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 PASSWORD_MODE_RANDOM = "random"
@@ -74,6 +82,8 @@ STATUS_DEFERRED = "deferred"
 # Migration run status constants
 RUN_STATUS_IN_PROGRESS = "in_progress"
 RUN_STATUS_COMPLETED = "completed"
+RUN_STATUS_COMPLETED_WITH_ERRORS = "completed_with_errors"
+RUN_STATUS_COMPLETED_WITH_WARNINGS = "completed_with_warnings"
 RUN_STATUS_FAILED = "failed"
 RUN_STATUS_CANCELLED = "cancelled"
 
@@ -83,6 +93,7 @@ CONFLICT_TYPE_DN_COLLISION = "dn_collision"
 CONFLICT_TYPE_SAM_COLLISION = "sam_collision"
 
 # Error severity levels
+SEVERITY_INFO = "info"
 SEVERITY_WARNING = "warning"
 SEVERITY_ERROR = "error"
 SEVERITY_CRITICAL = "critical"

@@ -1,0 +1,17 @@
+# Directory Objects Migrator v1.0
+# Requirements for ALT Linux with system packages
+
+# LDAP connectivity
+# System package: python3-module-ldap3-2.9-alt1.noarch
+ldap3>=2.9
+
+# GUI Framework
+# System package: python3-module-PyQt5-5.15.10-alt3.x86_64
+PyQt5>=5.15.10
+
+# Database (built-in)
+# System package: python3-modules-sqlite3-3.12.13-alt1.x86_64
+# sqlite3 - included in Python standard library
+
+# Additional utilities
+pyyaml>=5.4  # For configuration files

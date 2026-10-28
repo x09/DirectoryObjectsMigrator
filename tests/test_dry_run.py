@@ -98,7 +98,7 @@ def main():
     db.add_object(
         source_guid=src.entries[src._key(f'CN=user5,{LEVEL5}')]['attributes']['objectGUID'],
         source_dn=f'CN=user5,{LEVEL5}',
-        dest_guid='seeded', dest_dn=dest_user5,
+        dest_guid=dst.get_object_by_dn(dest_user5)['attributes']['objectGUID'], dest_dn=dest_user5,
         object_type='user', status='created', run_id=1,
     )
     check("target is now resolvable",

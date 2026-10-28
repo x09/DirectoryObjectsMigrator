@@ -5,11 +5,12 @@
 CREATE TABLE IF NOT EXISTS migration_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    direction_id TEXT NOT NULL DEFAULT '',
     source_base_dn TEXT NOT NULL,
     dest_base_dn TEXT NOT NULL,
     source_dc TEXT,
     dest_dc TEXT,
-    status TEXT DEFAULT 'in_progress', -- 'in_progress', 'completed', 'failed', 'cancelled'
+    status TEXT DEFAULT 'in_progress', -- in_progress/completed/completed_with_warnings/completed_with_errors/failed/cancelled
     objects_analyzed INTEGER DEFAULT 0,
     objects_created INTEGER DEFAULT 0,
     objects_updated INTEGER DEFAULT 0,
@@ -25,7 +26,8 @@ CREATE TABLE IF NOT EXISTS migration_map (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
     -- Source object identification
-    source_guid TEXT UNIQUE NOT NULL,
+    direction_id TEXT NOT NULL DEFAULT '',
+    source_guid TEXT NOT NULL,
     source_dn TEXT NOT NULL,
     source_sid TEXT,
     source_sam_account_name TEXT,
@@ -55,6 +57,7 @@ CREATE TABLE IF NOT EXISTS migration_map (
     error_message TEXT,
     notes TEXT,
 
+    UNIQUE (direction_id, source_guid),
     FOREIGN KEY (migration_run_id) REFERENCES migration_runs(run_id),
     FOREIGN KEY (first_migration_run_id) REFERENCES migration_runs(run_id)
 );
@@ -73,6 +76,7 @@ CREATE TABLE IF NOT EXISTS deferred_references (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
     -- Parent object (the one that has the reference)
+    direction_id TEXT NOT NULL DEFAULT '',
     parent_object_guid TEXT NOT NULL,
     parent_object_dn TEXT NOT NULL,
     parent_object_type TEXT NOT NULL,
@@ -102,7 +106,7 @@ CREATE TABLE IF NOT EXISTS deferred_references (
 
     notes TEXT,
 
-    FOREIGN KEY (parent_object_guid) REFERENCES migration_map(source_guid),
+    FOREIGN KEY (direction_id, parent_object_guid) REFERENCES migration_map(direction_id, source_guid),
     FOREIGN KEY (created_run_id) REFERENCES migration_runs(run_id),
     FOREIGN KEY (resolution_run_id) REFERENCES migration_runs(run_id)
 );
@@ -116,6 +120,7 @@ CREATE INDEX IF NOT EXISTS idx_deferred_attribute ON deferred_references(attribu
 -- Attribute changes log (for detailed tracking)
 CREATE TABLE IF NOT EXISTS attribute_changes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction_id TEXT NOT NULL DEFAULT '',
     object_guid TEXT NOT NULL,
     migration_run_id INTEGER,
     attribute_name TEXT NOT NULL,
@@ -126,7 +131,7 @@ CREATE TABLE IF NOT EXISTS attribute_changes (
     error_message TEXT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    FOREIGN KEY (object_guid) REFERENCES migration_map(source_guid),
+    FOREIGN KEY (direction_id, object_guid) REFERENCES migration_map(direction_id, source_guid),
     FOREIGN KEY (migration_run_id) REFERENCES migration_runs(run_id)
 );
 
@@ -154,7 +159,7 @@ CREATE TABLE IF NOT EXISTS migration_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     migration_run_id INTEGER,
     error_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    severity TEXT, -- 'warning', 'error', 'critical'
+    severity TEXT, -- 'info', 'warning', 'error', 'critical'
     phase TEXT, -- 'analysis', 'ou_creation', 'object_creation', 'attributes', 'references', 'verification'
     object_dn TEXT,
     object_type TEXT,

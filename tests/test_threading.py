@@ -158,7 +158,7 @@ def main():
     print("\n=== Database readable from the GUI thread afterwards ===")
     stats = db.get_statistics(result.run_id)
     check("statistics query succeeded from GUI thread", bool(stats), True)
-    check("run marked completed", stats.get('status'), 'completed')
+    check("run marked completed with pending-reference warning", stats.get('status'), 'completed_with_warnings')
     db.close()
 
     print("\n" + "=" * 62)

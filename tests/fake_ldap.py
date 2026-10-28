@@ -92,6 +92,14 @@ class FakeLDAPConnector:
                 results.append({'dn': entry['dn'],
                                 'attributes': dict(entry['attributes'])})
 
+        import re
+        equality = re.fullmatch(r'\((sAMAccountName|userPrincipalName)=(.*)\)', search_filter)
+        if equality:
+            attr, encoded = equality.groups()
+            value = re.sub(r'\\([0-9a-fA-F]{2})', lambda m: chr(int(m[1], 16)), encoded)
+            results = [row for row in results
+                       if str(row['attributes'].get(attr, '')).casefold() == value.casefold()]
+
         if not results and scope == ldap3.BASE:
             from core.ldap_connector import LDAPOperationError
             raise LDAPOperationError(
@@ -104,6 +112,12 @@ class FakeLDAPConnector:
         if not entry:
             return None
         return {'dn': entry['dn'], 'attributes': dict(entry['attributes'])}
+
+    def get_object_by_guid(self, guid, base_dn=None):
+        for entry in self.entries.values():
+            if str(entry['attributes'].get('objectGUID', '')).strip('{}').lower() == str(guid).strip('{}').lower():
+                return {'dn': entry['dn'], 'attributes': dict(entry['attributes'])}
+        return None
 
     def object_exists(self, dn: str) -> bool:
         return self._key(dn) in self.entries

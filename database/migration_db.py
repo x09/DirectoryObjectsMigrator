@@ -4,6 +4,9 @@ SQLite database interface for migration tracking
 import sqlite3
 import json
 import threading
+import re
+import hashlib
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -22,6 +25,8 @@ class MigrationDB:
         """
         self.db_path = db_path or settings.DB_FILE
         self.connection = None
+        self.direction_id = None  # None is the administrative, all-directions view.
+        self._owner = None
         self._lock = threading.RLock()
         self._connect()
         self._initialize_schema()
@@ -35,6 +40,8 @@ class MigrationDB:
         'mark_reference_resolved', 'update_reference_check', 'add_conflict',
         'get_conflicts', 'log_error', 'get_errors', 'get_statistics', 'close',
         'counts', 'is_empty', 'backup', 'reset', 'vacuum',
+        'for_direction', 'refresh_mapping', 'has_unassigned_history',
+        'get_reference_parents_for_run',
     )
 
     def _install_locking(self):
@@ -80,9 +87,130 @@ class MigrationDB:
             with open(schema_file, 'r', encoding='utf-8') as f:
                 schema_sql = f.read()
 
+            self._upgrade_direction_schema(schema_sql)
+
             # Execute schema (multiple statements)
             self.connection.executescript(schema_sql)
             self.connection.commit()
+
+    def _upgrade_direction_schema(self, schema_sql):
+        """Upgrade legacy bookkeeping atomically, retaining IDs and a backup."""
+        columns = self.connection.execute('PRAGMA table_info(migration_map)').fetchall()
+        if not columns or 'direction_id' in {r['name'] for r in columns}:
+            return
+        self.backup('before_v12_directions_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+        self.connection.execute('PRAGMA foreign_keys = OFF')
+        try:
+            self.connection.execute('BEGIN IMMEDIATE')
+            self.connection.execute("ALTER TABLE migration_runs ADD COLUMN direction_id TEXT NOT NULL DEFAULT ''")
+            for table in ('migration_map', 'deferred_references', 'attribute_changes'):
+                definition = re.search(r'CREATE TABLE IF NOT EXISTS ' + table + r' \(.*?\n\);', schema_sql, re.S).group()
+                self.connection.execute(definition.replace(table + ' (', table + '_v12 (', 1))
+                old_cols = [row['name'] for row in self.connection.execute('PRAGMA table_info(' + table + ')')]
+                names = ','.join(old_cols)
+                self.connection.execute(f'INSERT INTO {table}_v12 ({names}) SELECT {names} FROM {table}')
+            for view in ('v_migration_summary', 'v_unresolved_references', 'v_latest_migration'):
+                self.connection.execute('DROP VIEW IF EXISTS ' + view)
+            for table in ('attribute_changes', 'deferred_references', 'migration_map'):
+                self.connection.execute('DROP TABLE ' + table)
+            for table in ('migration_map', 'deferred_references', 'attribute_changes'):
+                self.connection.execute(f'ALTER TABLE {table}_v12 RENAME TO {table}')
+            if self.connection.execute('PRAGMA foreign_key_check').fetchall():
+                raise RuntimeError('Legacy migration database contains invalid references; upgrade rolled back')
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        finally:
+            self.connection.execute('PRAGMA foreign_keys = ON')
+
+    def for_direction(self, source_identity, dest_identity, source_domain, dest_domain):
+        """Immutable scoped view, sharing the owner's connection and lock.
+
+        Legacy runs can only be attributed when both stored domain names agree.
+        Every imported mapping still requires live GUID validation before use.
+        Ambiguous/unattributed rows remain quarantined for inspection and backup.
+        """
+        key = hashlib.sha256(json.dumps([source_identity, dest_identity]).encode()).hexdigest()
+        if self.direction_id is not None and self.direction_id != key:
+            raise ValueError('Database view belongs to another migration direction')
+        with self.connection:
+            self.connection.execute('PRAGMA defer_foreign_keys = ON')
+            # Do not move legacy maps whose recorded runs disagree on direction.
+            self.connection.execute("""
+                UPDATE migration_runs SET direction_id=? WHERE direction_id=''
+                AND run_id IN (SELECT migration_run_id FROM run_configurations
+                    WHERE lower(rtrim(source_domain,'.'))=? AND lower(rtrim(dest_domain,'.'))=?)
+            """, (key, source_domain.rstrip('.').lower(), dest_domain.rstrip('.').lower()))
+            self.connection.execute("""
+                UPDATE migration_map SET direction_id=? WHERE direction_id=''
+                AND first_migration_run_id IN (SELECT run_id FROM migration_runs WHERE direction_id=?)
+                AND migration_run_id IN (SELECT run_id FROM migration_runs WHERE direction_id=?)
+                AND NOT EXISTS (SELECT 1 FROM deferred_references d
+                    LEFT JOIN migration_runs r ON r.run_id=d.created_run_id
+                    WHERE d.direction_id='' AND d.parent_object_guid=migration_map.source_guid
+                    AND coalesce(r.direction_id,'') != ?)
+                AND NOT EXISTS (SELECT 1 FROM attribute_changes a
+                    LEFT JOIN migration_runs r ON r.run_id=a.migration_run_id
+                    WHERE a.direction_id='' AND a.object_guid=migration_map.source_guid
+                    AND coalesce(r.direction_id,'') != ?)
+            """, (key, key, key, key, key))
+            self.connection.execute("""
+                UPDATE deferred_references SET direction_id=? WHERE direction_id=''
+                AND created_run_id IN (SELECT run_id FROM migration_runs WHERE direction_id=?)
+                AND parent_object_guid IN (SELECT source_guid FROM migration_map WHERE direction_id=?)
+            """, (key, key, key))
+            self.connection.execute("""
+                UPDATE attribute_changes SET direction_id=? WHERE direction_id=''
+                AND migration_run_id IN (SELECT run_id FROM migration_runs WHERE direction_id=?)
+                AND object_guid IN (SELECT source_guid FROM migration_map WHERE direction_id=?)
+            """, (key, key, key))
+        view = object.__new__(MigrationDB)
+        view.db_path = self.db_path
+        view.connection = self.connection
+        view._lock = self._lock
+        view.direction_id = key
+        view._owner = self._owner or self
+        view._install_locking()
+        return view
+
+    def has_unassigned_history(self):
+        return bool(self.connection.execute("SELECT 1 FROM migration_map WHERE direction_id='' LIMIT 1").fetchone())
+
+    @staticmethod
+    def _guid(value):
+        try:
+            return str(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError):
+            return value
+
+    def _guid_mapping(self, direction, source_guid):
+        return self.connection.execute("""SELECT * FROM migration_map WHERE direction_id=?
+            AND lower(replace(replace(source_guid,'{',''),'}',''))=?""",
+            (direction, self._guid(source_guid))).fetchone()
+
+    def _run_direction(self, run_id):
+        row = self.connection.execute('SELECT direction_id FROM migration_runs WHERE run_id=?', (run_id,)).fetchone()
+        if row is None:
+            raise ValueError('Unknown migration run')
+        if self.direction_id is not None and row['direction_id'] != self.direction_id:
+            raise ValueError('Run belongs to another migration direction')
+        return row['direction_id']
+
+    def refresh_mapping(self, source_guid, source_dn, dest_dn):
+        if self.direction_id is None:
+            raise ValueError('A direction is required to refresh a mapping')
+        existing = self._guid_mapping(self.direction_id, source_guid)
+        if existing is None:
+            raise ValueError('No mapping in this migration direction')
+        source_guid = existing['source_guid']
+        self.connection.execute("""UPDATE migration_map SET source_dn=?, dest_dn=?,
+            last_seen=CURRENT_TIMESTAMP WHERE direction_id=? AND source_guid=?""",
+            (source_dn, dest_dn, self.direction_id, source_guid))
+        self.connection.execute("""UPDATE deferred_references SET parent_object_dn=?
+            WHERE direction_id=? AND parent_object_guid=? AND resolved=0""",
+            (dest_dn, self.direction_id, source_guid))
+        self.connection.commit()
 
     # Tables cleared by reset(), children before parents so foreign keys hold
     _DATA_TABLES = (
@@ -236,6 +364,8 @@ class MigrationDB:
 
     def close(self):
         """Close database connection (safe to call more than once)"""
+        if self._owner is not None:
+            return  # Only the owner closes the shared connection.
         if self.connection:
             try:
                 self.connection.close()
@@ -268,9 +398,9 @@ class MigrationDB:
         cursor = self.connection.cursor()
         cursor.execute("""
             INSERT INTO migration_runs (
-                source_base_dn, dest_base_dn, source_dc, dest_dc, status
-            ) VALUES (?, ?, ?, ?, ?)
-        """, (source_base_dn, dest_base_dn, source_dc, dest_dc, settings.RUN_STATUS_IN_PROGRESS))
+                source_base_dn, dest_base_dn, source_dc, dest_dc, status, direction_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (source_base_dn, dest_base_dn, source_dc, dest_dc, settings.RUN_STATUS_IN_PROGRESS, self.direction_id or ''))
 
         run_id = cursor.lastrowid
 
@@ -396,8 +526,10 @@ class MigrationDB:
         cursor = self.connection.cursor()
 
         # Check if object already exists
-        cursor.execute("SELECT id, first_migration_run_id FROM migration_map WHERE source_guid = ?", (source_guid,))
-        existing = cursor.fetchone()
+        direction = self._run_direction(run_id)
+        existing = self._guid_mapping(direction, source_guid)
+        source_guid = existing['source_guid'] if existing else self._guid(source_guid)
+        dest_guid = self._guid(dest_guid)
 
         if existing:
             # Update existing
@@ -411,44 +543,46 @@ class MigrationDB:
                     last_updated = CURRENT_TIMESTAMP,
                     migration_run_id = ?,
                     error_message = ?
-                WHERE source_guid = ?
-            """, (source_dn, dest_guid, dest_dn, status, run_id, error_message, source_guid))
+                WHERE direction_id=? AND source_guid = ?
+            """, (source_dn, dest_guid, dest_dn, status, run_id, error_message, direction, source_guid))
         else:
             # Insert new
             cursor.execute("""
                 INSERT INTO migration_map (
-                    source_guid, source_dn, source_sid, source_sam_account_name,
+                    direction_id, source_guid, source_dn, source_sid, source_sam_account_name,
                     dest_guid, dest_dn, object_type, object_class, status,
                     migration_run_id, first_migration_run_id, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                source_guid, source_dn, source_sid, source_sam,
+                direction, source_guid, source_dn, source_sid, source_sam,
                 dest_guid, dest_dn, object_type, object_class, status,
                 run_id, run_id, error_message
             ))
 
         self.connection.commit()
 
-    def get_object_by_source_guid(self, source_guid: str) -> Optional[Dict[str, Any]]:
-        """Get object mapping by source GUID"""
-        cursor = self.connection.cursor()
-        cursor.execute("SELECT * FROM migration_map WHERE source_guid = ?", (source_guid,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+    def _find_mapping(self, column, value):
+        where = column + '=?'
+        if column == 'source_guid':
+            where = "lower(replace(replace(source_guid,'{',''),'}',''))=?"
+            value = self._guid(value)
+        params = [value]
+        if self.direction_id is not None:
+            where += ' AND direction_id=?'
+            params.append(self.direction_id)
+        rows = self.connection.execute('SELECT * FROM migration_map WHERE ' + where, params).fetchall()
+        if len(rows) > 1:
+            raise ValueError('Ambiguous mapping; select a migration direction')
+        return dict(rows[0]) if rows else None
 
-    def get_object_by_source_dn(self, source_dn: str) -> Optional[Dict[str, Any]]:
-        """Get object mapping by source DN"""
-        cursor = self.connection.cursor()
-        cursor.execute("SELECT * FROM migration_map WHERE source_dn = ?", (source_dn,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+    def get_object_by_source_guid(self, source_guid):
+        return self._find_mapping('source_guid', source_guid)
 
-    def get_object_by_dest_dn(self, dest_dn: str) -> Optional[Dict[str, Any]]:
-        """Get object mapping by destination DN"""
-        cursor = self.connection.cursor()
-        cursor.execute("SELECT * FROM migration_map WHERE dest_dn = ?", (dest_dn,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+    def get_object_by_source_dn(self, source_dn):
+        return self._find_mapping('source_dn', source_dn)
+
+    def get_object_by_dest_dn(self, dest_dn):
+        return self._find_mapping('dest_dn', dest_dn)
 
     # Deferred references management
 
@@ -464,15 +598,20 @@ class MigrationDB:
         referenced_type: Optional[str] = None
     ):
         """Add a deferred reference"""
+        direction = self._run_direction(run_id)
+        mapped_parent = self._guid_mapping(direction, parent_guid)
+        if mapped_parent is None:
+            raise ValueError('No parent mapping in this migration direction')
+        parent_guid = mapped_parent['source_guid']
         cursor = self.connection.cursor()
         cursor.execute("""
             INSERT INTO deferred_references (
-                parent_object_guid, parent_object_dn, parent_object_type,
+                direction_id, parent_object_guid, parent_object_dn, parent_object_type,
                 attribute_name, referenced_source_guid, referenced_source_dn,
                 referenced_object_type, created_run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            parent_guid, parent_dn, parent_type,
+            direction, parent_guid, parent_dn, parent_type,
             attribute_name, referenced_guid, referenced_dn,
             referenced_type, run_id
         ))
@@ -488,22 +627,26 @@ class MigrationDB:
         Returns:
             List of unresolved references
         """
-        cursor = self.connection.cursor()
-
+        clauses = ['resolved=0']
+        params = []
+        if self.direction_id is not None:
+            clauses.append('direction_id=?')
+            params.append(self.direction_id)
         if parent_guid:
-            cursor.execute("""
-                SELECT * FROM deferred_references
-                WHERE resolved = 0 AND parent_object_guid = ?
-                ORDER BY parent_object_dn, attribute_name
-            """, (parent_guid,))
-        else:
-            cursor.execute("""
-                SELECT * FROM deferred_references
-                WHERE resolved = 0
-                ORDER BY parent_object_dn, attribute_name
-            """)
+            clauses.append("lower(replace(replace(parent_object_guid,'{',''),'}',''))=?")
+            params.append(self._guid(parent_guid))
+        rows = self.connection.execute('SELECT * FROM deferred_references WHERE ' +
+            ' AND '.join(clauses) + ' ORDER BY parent_object_dn, attribute_name', params)
+        return [dict(row) for row in rows]
 
-        return [dict(row) for row in cursor.fetchall()]
+    def get_reference_parents_for_run(self, run_id):
+        """Parents changed by deferred-reference work, including outside the scope."""
+        direction = self._run_direction(run_id)
+        rows = self.connection.execute("""
+            SELECT DISTINCT parent_object_guid FROM deferred_references
+            WHERE direction_id=? AND (created_run_id=? OR resolution_run_id=?)
+        """, (direction, run_id, run_id))
+        return [row['parent_object_guid'] for row in rows]
 
     def mark_reference_resolved(self, ref_id: int, dest_dn: str, run_id: int):
         """Mark a deferred reference as resolved"""
@@ -514,8 +657,8 @@ class MigrationDB:
                 resolved_dest_dn = ?,
                 resolution_run_id = ?,
                 resolution_timestamp = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (dest_dn, run_id, ref_id))
+            WHERE id = ? AND direction_id=?
+        """, (dest_dn, run_id, ref_id, self._run_direction(run_id)))
         self.connection.commit()
 
     def update_reference_check(self, ref_id: int):
@@ -525,8 +668,8 @@ class MigrationDB:
             UPDATE deferred_references SET
                 check_count = check_count + 1,
                 last_check_timestamp = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (ref_id,))
+            WHERE id = ? AND (? IS NULL OR direction_id=?)
+        """, (ref_id, self.direction_id, self.direction_id))
         self.connection.commit()
 
     # Conflicts management

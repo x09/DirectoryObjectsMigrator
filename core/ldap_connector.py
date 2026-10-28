@@ -4,6 +4,8 @@ Handles connection and operations with LDAP servers (MSAD and Samba AD)
 """
 import ldap3
 import uuid
+import re
+from copy import deepcopy
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 import time
@@ -133,6 +135,7 @@ class LDAPConnector:
                     user=user_dn,
                     password=self.password,
                     auto_bind=True,
+                    auto_range=False,
                     raise_exceptions=True,
                     receive_timeout=self.timeout
                 )
@@ -204,7 +207,10 @@ class LDAPConnector:
         size_limit: int = 0
     ) -> List[Dict[str, Any]]:
         """
-        Perform LDAP search
+        Perform LDAP search; unlimited non-BASE reads consume 500-entry pages.
+
+        Continuation referrals are not followed outside the requested directory.
+        Any failed page aborts the entire read rather than returning partial data.
 
         Args:
             base_dn: Base DN for search
@@ -221,50 +227,164 @@ class LDAPConnector:
         """
         self._ensure_connected()
 
+        # Unlimited subtree reads must consume every page. Never return a partial
+        # successful-looking list after a size/time limit or a failed later page.
+        paged = scope != ldap3.BASE and size_limit == 0
+        cookie = None
+        entries = []
+        original_auto_referrals = self.connection.auto_referrals
+        self.connection.auto_referrals = False
+        original_auto_range = getattr(self.connection, 'auto_range', True)
+        self.connection.auto_range = False
+        # ldap3's empty-attribute synthesis deletes the base name for every
+        # ranged key, even if it is absent (or already deleted). Explicit range
+        # continuations can therefore raise KeyError before we see the response.
+        original_empty_attributes = getattr(self.connection, 'empty_attributes', True)
+        self.connection.empty_attributes = False
+        requested = list(attributes) if isinstance(attributes, (list, tuple)) else [attributes or ldap3.ALL_ATTRIBUTES]
+        # Snapshot identity/version with each result so concurrent edits cannot
+        # splice different membership lists into one successful response.
+        requested += [name for name in ('objectGUID', 'uSNChanged')
+                      if name.lower() not in {str(a).lower() for a in requested}]
         try:
-            # Perform search
-            success = self.connection.search(
-                search_base=base_dn,
-                search_filter=search_filter,
-                search_scope=scope,
-                attributes=attributes if attributes else ldap3.ALL_ATTRIBUTES,
-                size_limit=size_limit
-            )
-
-            if not success:
-                raise LDAPOperationError(f"Search failed: {self.connection.result}")
-
-            # Convert entries to list of dicts
-            entries = []
-            for entry in self.connection.entries:
-                entry_dict = {
-                    'dn': entry.entry_dn,
-                    'attributes': {}
-                }
-
-                # Extract attributes
-                for attr in entry.entry_attributes:
-                    value = entry[attr].value
-
-                    # Handle special attributes
-                    if attr.lower() == 'objectguid':
-                        # Convert binary GUID to string
-                        if isinstance(value, bytes):
-                            value = str(uuid.UUID(bytes_le=value))
-                    elif attr.lower() == 'objectsid':
-                        # Decode to S-1-5-21-...-RID form. The trailing RID is how
-                        # built-in principals are identified reliably, independent of
-                        # the display language of the domain.
-                        value = self.format_sid(value)
-
-                    entry_dict['attributes'][attr] = value
-
-                entries.append(entry_dict)
-
+            while True:
+                options = dict(search_base=base_dn, search_filter=search_filter,
+                    search_scope=scope,
+                    attributes=requested,
+                    size_limit=size_limit)
+                if paged:
+                    options.update(paged_size=500, paged_cookie=cookie,
+                                   paged_criticality=True)
+                self.connection.search(**options)
+                # False can also mean an empty successful search in ldap3.
+                if self.connection.result.get('result') != 0:
+                    raise LDAPOperationError(f"Search failed: {self.connection.result}")
+                # Range fetches replace connection.result/entries. Preserve the
+                # outer page and its cookie BEFORE issuing supplemental BASE reads.
+                page_result = deepcopy(self.connection.result)
+                page_entries = [self._entry_dict(entry) for entry in self.connection.entries]
+                for entry in page_entries:
+                    self._complete_ranges(entry)
+                    entries.append(entry)
+                if not paged:
+                    break
+                control = page_result.get('controls', {}).get('1.2.840.113556.1.4.319')
+                if not control or 'cookie' not in control.get('value', {}):
+                    raise LDAPOperationError('Paged search response is missing its cookie control')
+                cookie = control['value']['cookie']
+                if not cookie:
+                    break
             return entries
-
         except ldap3.core.exceptions.LDAPException as e:
-            raise LDAPOperationError(f"Search error: {e}")
+            raise LDAPOperationError(f"Search error: {e}") from e
+        finally:
+            self.connection.auto_referrals = original_auto_referrals
+            self.connection.auto_range = original_auto_range
+            self.connection.empty_attributes = original_empty_attributes
+
+    @staticmethod
+    def _entry_dict(entry):
+        attrs = {}
+        for attr in entry.entry_attributes:
+            value = entry[attr].value
+            if attr.lower() == 'objectguid' and isinstance(value, bytes):
+                value = str(uuid.UUID(bytes_le=value))
+            elif attr.lower() == 'accountexpires':
+                raw = entry[attr].raw_values
+                if len(raw) != 1:
+                    raise LDAPOperationError('Invalid accountExpires value count')
+                value = int(raw[0])
+            elif attr.lower() == 'objectsid':
+                value = LDAPConnector.format_sid(value)
+            attrs[attr] = value
+        return {'dn': entry.entry_dn, 'attributes': attrs}
+
+    @staticmethod
+    def _range_values(value):
+        return value if isinstance(value, list) else ([] if value is None else [value])
+
+    @staticmethod
+    def _range_version(entry):
+        attrs = {k.lower(): v for k, v in entry['attributes'].items()}
+        guid = attrs.get('objectguid')
+        version = attrs.get('usnchanged')
+        if guid is None or version is None:
+            raise LDAPOperationError('Cannot verify ranged read without objectGUID and uSNChanged')
+        return str(guid).strip('{}').lower(), str(version)
+
+    def _complete_ranges(self, entry):
+        """Strict contiguous ranged retrieval; no partial values escape on failure."""
+        attrs = entry['attributes']
+        ranged = {}
+        for name in list(attrs):
+            if ';range=' not in name.lower():
+                continue
+            match = re.fullmatch(r'([^;]+);range=(\d+)-(\d+|\*)', name, re.I)
+            if not match:
+                raise LDAPOperationError(f'Malformed LDAP range attribute: {name}')
+            base = match[1]
+            if base.lower() in ranged:
+                raise LDAPOperationError(f'Multiple ranges returned for {base}')
+            ranged[base.lower()] = (base, name)
+        if not ranged:
+            return
+        version = self._range_version(entry)
+        for base, name in ranged.values():
+            for ordinary in list(attrs):
+                if ordinary.lower() == base.lower():
+                    if self._range_values(attrs[ordinary]):
+                        raise LDAPOperationError(f'Ambiguous ordinary and ranged values for {base}')
+                    del attrs[ordinary]
+            expected_start = 0
+            combined = []
+            seen = set()
+            current = entry
+            while True:
+                match = re.fullmatch(r'([^;]+);range=(\d+)-(\d+|\*)', name, re.I)
+                if not match or match[1].lower() != base.lower() or int(match[2]) != expected_start:
+                    raise LDAPOperationError(f'Non-contiguous LDAP range for {base} on {entry["dn"]}')
+                values = self._range_values(current['attributes'][name])
+                upper = match[3]
+                if not values:
+                    raise LDAPOperationError(f'Empty LDAP range response for {base}; completeness not confirmed')
+                if upper != '*':
+                    end = int(upper)
+                    if end < expected_start or len(values) != end - expected_start + 1:
+                        raise LDAPOperationError(f'Invalid LDAP range length for {base}')
+                for value in values:
+                    key = (type(value).__name__, repr(value))
+                    if key in seen:
+                        raise LDAPOperationError(f'Duplicate value across LDAP ranges for {base}')
+                    seen.add(key)
+                combined.extend(values)
+                if current is entry:
+                    del attrs[name]
+                if upper == '*':
+                    break
+                expected_start = end + 1
+                self.connection.search(search_base=entry['dn'], search_filter='(objectClass=*)',
+                    search_scope=ldap3.BASE,
+                    attributes=[f'{base};range={expected_start}-*', 'objectGUID', 'uSNChanged'])
+                if self.connection.result.get('result') != 0:
+                    raise LDAPOperationError(f'LDAP range read failed for {entry["dn"]}: {self.connection.result}')
+                responses = list(self.connection.entries)
+                if len(responses) != 1:
+                    raise LDAPOperationError(f'Object disappeared during ranged read: {entry["dn"]}')
+                current = self._entry_dict(responses[0])
+                if current['dn'].casefold() != entry['dn'].casefold() or self._range_version(current) != version:
+                    raise LDAPOperationError(f'Object changed during ranged read; retry analysis: {entry["dn"]}')
+                names = [key for key in current['attributes'] if key.lower().startswith(base.lower() + ';range=')]
+                requested_name = f'{base};range={expected_start}-*'.lower()
+                if len(names) > 1:
+                    # ldap3 empty_attributes can synthesize the requested spelling
+                    # beside the server's bounded response. Only ignore that empty
+                    # placeholder when another actual range is present.
+                    names = [key for key in names if not (
+                        key.lower() == requested_name and not self._range_values(current['attributes'][key]))]
+                if len(names) != 1:
+                    raise LDAPOperationError(f'Missing or ambiguous continuation range for {base}')
+                name = names[0]
+            attrs[base] = combined
 
     def list_child_containers(self, parent_dn: str, cancelled=None) -> List[Dict[str, Any]]:
         """Read one level of OU/container children, consuming every LDAP page.

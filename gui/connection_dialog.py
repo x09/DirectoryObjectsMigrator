@@ -5,7 +5,8 @@ Dialog for configuring Source and Destination DC connections
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLineEdit, QSpinBox, QCheckBox, QPushButton, QLabel,
-    QRadioButton, QButtonGroup, QMessageBox, QTabWidget, QWidget, QTextEdit
+    QRadioButton, QButtonGroup, QMessageBox, QTabWidget, QWidget, QTextEdit,
+    QScrollArea, QSizePolicy, QLayout
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -14,6 +15,15 @@ from core.ldap_connector import LDAPConnector, LDAPConnectionError
 from utils.config_manager import ConfigManager
 from utils.i18n import _
 from config import settings
+
+
+class WrappedPolicyLabel(QLabel):
+    """Keep complete policy text visible when the scrollable tab is resized."""
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        height = self.heightForWidth(event.size().width())
+        if height > 0 and self.minimumHeight() != height:
+            self.setMinimumHeight(height)
 
 
 class ConnectionDialog(QDialog):
@@ -162,6 +172,23 @@ class ConnectionDialog(QDialog):
         password_group = QGroupBox(_("Password Policy"))
         password_layout = QVBoxLayout()
 
+        self.password_policy_note = WrappedPolicyLabel(_(
+            "The password must meet the destination domain policy. Defaults: minimum 7 characters, "
+            "complexity on, password history 24, minimum age 1 day, maximum age 42 days, plaintext storage off. "
+            "Lockout defaults: threshold 0 (disabled), duration 30 minutes, reset counter after 30 minutes. "
+            "Actual domain settings take precedence; this application does not change them."))
+        self.password_policy_note.setWordWrap(True)
+        self.password_policy_note.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        password_layout.addWidget(self.password_policy_note)
+        self.password_fallback_note = WrappedPolicyLabel(_(
+            "If the server rejects a password, the application logs the failure and tries a new random password, "
+            "even in fixed-password mode (up to 3 retries). Random passwords contain uppercase and lowercase "
+            "letters, digits and symbols. Password values are not logged or saved in reports. "
+            "Check the report: a fallback password differs from the one entered. Users remain disabled."))
+        self.password_fallback_note.setWordWrap(True)
+        self.password_fallback_note.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        password_layout.addWidget(self.password_fallback_note)
+
         self.password_mode_group = QButtonGroup(self)
 
         self.random_password_radio = QRadioButton(_("Random Password"))
@@ -173,7 +200,7 @@ class ConnectionDialog(QDialog):
         length_layout.addSpacing(20)
         length_layout.addWidget(QLabel(_("Length:")))
         self.password_length = QSpinBox()
-        self.password_length.setRange(8, 64)
+        self.password_length.setRange(settings.DEFAULT_PASSWORD_POLICY['minimum_length'], 256)
         self.password_length.setValue(settings.DEFAULT_PASSWORD_LENGTH)
         length_layout.addWidget(self.password_length)
         length_layout.addStretch()
@@ -239,8 +266,12 @@ class ConnectionDialog(QDialog):
         layout.addStretch()
 
         self._refresh_db_status()
-
-        return widget
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
 
     def _create_exclusions_tab(self) -> QWidget:
         """Create custom exclusions configuration tab"""

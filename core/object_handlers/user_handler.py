@@ -8,6 +8,7 @@ from core.ldap_connector import LDAPOperationError
 from utils.password_generator import PasswordGenerator
 from config import settings
 import ldap3
+import re
 
 
 class UserHandler(ObjectHandler):
@@ -17,7 +18,7 @@ class UserHandler(ObjectHandler):
     UAC_NORMAL_ACCOUNT = 0x0200          # 512
     UAC_DISABLED_ACCOUNT = 0x0202        # 514 = NORMAL_ACCOUNT | ACCOUNTDISABLE
 
-    def __init__(self, *args, password_mode: str = None, fixed_password: str = None, **kwargs):
+    def __init__(self, *args, password_mode: str = None, fixed_password: str = None, password_length: int = None, **kwargs):
         """
         Initialize UserHandler
 
@@ -28,6 +29,11 @@ class UserHandler(ObjectHandler):
         super().__init__(*args, **kwargs)
         self.password_mode = password_mode or settings.DEFAULT_PASSWORD_MODE
         self.fixed_password = fixed_password or ''
+        self.password_length = max(settings.DEFAULT_PASSWORD_POLICY['minimum_length'],
+                                   password_length or settings.DEFAULT_PASSWORD_LENGTH)
+        self.password_events = []
+        self.password_failed = False
+        self._minimum_length = None
 
     def get_object_type(self) -> str:
         return settings.OBJECT_TYPE_USER
@@ -85,49 +91,77 @@ class UserHandler(ObjectHandler):
 
         return prepared
 
-    def _generate_password(self) -> str:
-        """
-        Generate password based on policy
+    def _event(self, severity, message):
+        self.password_events.append((severity, message))
+        getattr(self.logger, severity)(message)
 
-        Returns:
-            Password string
-        """
+    def _random_password(self, source_entry):
+        if self._minimum_length is None:
+            self._minimum_length = settings.DEFAULT_PASSWORD_POLICY['minimum_length']
+            try:
+                root = self.dest_conn.get_object_by_dn(self.dest_conn.domain_dn,
+                                                      attributes=['minPwdLength'])
+                value = root['attributes'].get('minPwdLength') if root else None
+                if isinstance(value, list):
+                    value = value[0] if value else None
+                if value is not None:
+                    self._minimum_length = max(self._minimum_length, int(value))
+            except Exception:
+                self._event('warning', 'Cannot read destination minimum password length; using configured defaults')
+        attrs = source_entry.get('attributes', {})
+        tokens = [str(attrs.get('sAMAccountName', ''))]
+        for key in ('displayName', 'cn', 'givenName', 'sn'):
+            tokens.extend(re.split(r'[\s,._#-]+', str(attrs.get(key, ''))))
+        return PasswordGenerator.generate_compliant(
+            length=max(self.password_length, self._minimum_length), forbidden=tokens)
+
+    def _generate_password(self) -> str:
+        """Compatibility helper; account-aware creation uses configure_password."""
         if self.password_mode == settings.PASSWORD_MODE_FIXED and self.fixed_password:
             return self.fixed_password
-        else:
-            return PasswordGenerator.generate(
-                length=settings.DEFAULT_PASSWORD_LENGTH,
-                charset=settings.DEFAULT_PASSWORD_CHARSET
-            )
+        return self._random_password({})
 
     def _set_password(self, dest_dn: str, password: str) -> bool:
-        """
-        Set user password in destination
-
-        Args:
-            dest_dn: Destination DN
-            password: Password to set
-
-        Returns:
-            True if successful
-        """
+        """Set the AD password only; never bypass rejection using userPassword."""
         try:
-            # In LDAP, password is set via unicodePwd attribute (for AD)
-            # Format: UTF-16LE encoded, enclosed in quotes
-            password_value = f'"{password}"'.encode('utf-16-le')
-
-            self.dest_conn.modify(dest_dn, {'unicodePwd': password_value})
+            value = ('"' + password + '"').encode('utf-16-le')
+            if self.dest_conn.modify(dest_dn, {'unicodePwd': value}) is not True:
+                raise LDAPOperationError('LDAP modify returned False')
             return True
+        except Exception as exc:
+            # Exception text may embed submitted values. Log only recognized LDAP
+            # categories, never the message, password or encoded password bytes.
+            description = type(exc).__name__
+            for category in ('constraintViolation', 'insufficientAccessRights',
+                             'unwillingToPerform', 'unavailable', 'strongerAuthRequired'):
+                if category.lower() in str(exc).lower():
+                    description += ': ' + category
+                    break
+            self._event('warning', f'Password rejected or not confirmed for {dest_dn}: {description}')
+            return False
 
-        except Exception as e:
-            self.logger.warning(f"Failed to set password for {dest_dn}: {e}")
-            # Try alternative method (userPassword for OpenLDAP/Samba)
-            try:
-                self.dest_conn.modify(dest_dn, {'userPassword': password})
+    def configure_password(self, source_entry, dest_dn):
+        self.password_events = []
+        self.password_failed = False
+        try:
+            initial = (self.fixed_password if self.password_mode == settings.PASSWORD_MODE_FIXED
+                       and self.fixed_password else self._random_password(source_entry))
+            if self._set_password(dest_dn, initial):
+                self._event('info', f'Password accepted by destination for {dest_dn}')
                 return True
-            except Exception as e2:
-                self.logger.error(f"Failed to set password (both methods) for {dest_dn}: {e2}")
-                return False
+            self._event('warning', f'Trying a new random password for {dest_dn}, even if a fixed password was selected')
+            for attempt in range(settings.PASSWORD_RANDOM_RETRIES):
+                password = self._random_password(source_entry)
+                if password == initial:
+                    continue
+                if self._set_password(dest_dn, password):
+                    self._event('warning', f'Random fallback password accepted for {dest_dn}; the configured password must not be assumed to apply')
+                    return True
+        except Exception as exc:
+            self._event('warning', f'Password generation/setup failed for {dest_dn}: {type(exc).__name__}')
+        self.password_failed = True
+        self._event('error', f'Password was not confirmed for {dest_dn}; administrator must reset it before enabling the account')
+        return False
 
     def create(self, source_entry: Dict[str, Any], dest_dn: str) -> bool:
         """
@@ -143,6 +177,8 @@ class UserHandler(ObjectHandler):
         Raises:
             LDAPOperationError: If creation fails
         """
+        self.password_events = []
+        self.password_failed = False
         # Prepare attributes
         attributes = self.prepare_attributes(source_entry)
 
@@ -165,16 +201,7 @@ class UserHandler(ObjectHandler):
             # the add above, so there is no window in which it is enabled.
             self.logger.success(f"Created user (disabled): {dest_dn}")
 
-            # Set password. A failure here is not fatal -- the account is disabled
-            # and the administrator has to set the real password anyway.
-            password = self._generate_password()
-            if self._set_password(dest_dn, password):
-                self.logger.debug(f"Password set for {dest_dn}")
-            else:
-                self.logger.warning(
-                    f"User created but password not set, administrator must set "
-                    f"one before enabling: {dest_dn}"
-                )
+            self.configure_password(source_entry, dest_dn)
 
             # Set primaryGroupID to 513 (Domain Users)
             try:
