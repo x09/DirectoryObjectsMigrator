@@ -178,7 +178,7 @@ class Analyzer:
                 if excluded:
                     self.logger.info(f"{dn} - SKIPPED ({excluded})")
                 else:
-                    reason = self.ignore_rules.builtin_reason(attributes)
+                    reason = self.ignore_rules.service_group_reason(dn, attributes) or self.ignore_rules.builtin_reason(attributes)
                     if reason:
                         self.logger.debug(f"{dn} - SKIPPED ({reason})")
             return

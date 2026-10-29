@@ -25,6 +25,11 @@ SKIP_DIRS = {'tests', '__pycache__', 'locale', 'logs', 'docs'}
 # Strings passed to _() through a variable or lookup, so the AST cannot see them.
 # Keep this in sync by hand when adding dynamic translation lookups.
 DYNAMIC_STRINGS = {
+    # Engine progress messages translated at the GUI boundary.
+    'Analyzing source domain...', 'Creating organizational units...',
+    'Creating objects...', 'Copying attributes...', 'Resolving references...',
+    'Verifying results...',
+
     # Plan action labels rendered by PreviewDialog via _(action)
     'CREATE', 'EXISTS', 'CONFLICT', 'ERROR', 'DEFERRED', 'SKIPPED',
     # TYPE_LABELS values rendered via _(TYPE_LABELS[...])

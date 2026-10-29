@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0] - 2026-10-29
+
+### Fixed
+- Exclude DNS service groups in the default Users container without matching RIDs.
+- Classify unsupported and explicitly excluded reference targets as skipped,
+  with reasons in preview and reports. Retire old pending rows without marking
+  them resolved; preserve their audit history and leave Dry Run unchanged.
+- Include ordinary CN=Users objects in domain-root migrations while retaining
+  built-in principal exclusions. Clarify preview text when no objects need creation.
+- Run discovery and destination planning in a background thread with a visible
+  busy indicator; translate migration phase status messages in the GUI.
+
 ## [1.2.0] - 2026-10-27
 
 ### Fixed

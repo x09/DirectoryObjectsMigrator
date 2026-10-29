@@ -228,7 +228,7 @@ class Verifier:
                                            ('group', GroupHandler), ('contact', ContactHandler)]}
         self.reference_resolver = ReferenceResolver(self.source_conn, self.dest_conn,
             self.migration_db, self.logger, self.source_conn.domain_dn, self.dest_conn.domain_dn,
-            dry_run=True)
+            dry_run=True, custom_exclusions=self.custom_exclusions)
 
     @staticmethod
     def _values(value):
@@ -331,7 +331,10 @@ class Verifier:
             expected_dns = set()
             for ref_dn in self._values(source_attrs.get(name)):
                 ref_dn = str(ref_dn)
-                if self.reference_resolver.is_builtin_target(ref_dn):
+                skip_reason = self.reference_resolver.is_builtin_target(ref_dn)
+                if skip_reason:
+                    self._finding(result, 'Skipped reference', source['dn'], dest_dn,
+                                  detail=f'{attr}: {ref_dn}; {skip_reason}', warning=True)
                     continue
                 try:
                     mapped_dn = self.reference_resolver.resolve_reference(ref_dn, update_mapping=False)

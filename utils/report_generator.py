@@ -44,6 +44,8 @@ class ReportGenerator:
         if not stats:
             raise ValueError(f"No statistics found for run_id {run_id}")
 
+        stats['reference_details'] = [row for row in self.migration_db.get_errors(run_id)
+                                      if row['phase'] == settings.PHASE_REFERENCES]
         stats['password_details'] = [row for row in self.migration_db.get_errors(run_id)
                                      if row['phase'] == settings.PHASE_PASSWORD]
         stats['verification_details'] = [row for row in self.migration_db.get_errors(run_id)
@@ -79,6 +81,8 @@ class ReportGenerator:
         if not stats:
             raise ValueError(f"No statistics found for run_id {run_id}")
 
+        stats['reference_details'] = [row for row in self.migration_db.get_errors(run_id)
+                                      if row['phase'] == settings.PHASE_REFERENCES]
         stats['password_details'] = [row for row in self.migration_db.get_errors(run_id)
                                      if row['phase'] == settings.PHASE_PASSWORD]
         stats['verification_details'] = [row for row in self.migration_db.get_errors(run_id)
@@ -274,6 +278,9 @@ class ReportGenerator:
         <h2>Conflicts</h2>
         {self._generate_conflicts_section(stats.get('conflicts_count', 0))}
 
+        <h2>Reference processing details</h2>
+        {self._verification_html(stats.get('reference_details', []))}
+
         <h2>Password setup</h2>
         {self._verification_html(stats.get('password_details', []))}
 
@@ -399,6 +406,10 @@ class ReportGenerator:
         lines.append(f"Unresolved: {total - resolved if total else 0}")
         lines.append("")
 
+        lines.append("REFERENCE PROCESSING DETAILS")
+        for row in stats.get('reference_details', []):
+            lines.append(f"[{row['severity']}] {row.get('object_dn', '')}: {row['error_message']}")
+        lines.append("")
         lines.append("PASSWORD SETUP")
         for row in stats.get('password_details', []):
             lines.append(f"[{row['severity']}] {row['error_message']}")

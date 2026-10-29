@@ -6,7 +6,7 @@ from pathlib import Path
 
 # Application metadata
 APP_NAME = "DirectoryObjectsMigrator"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_AUTHOR = "Anton"
 APP_DESCRIPTION = "Active Directory to Samba AD Migration Tool"
 
@@ -116,7 +116,6 @@ ATTR_DIRECT_REPORTS = "directReports"
 # Built-in DN patterns to ignore
 IGNORED_DN_PATTERNS = [
     "CN=Builtin,DC=",
-    "CN=Users,DC=",
     "CN=Computers,DC=",
     "CN=ForeignSecurityPrincipals,DC=",
     "CN=Managed Service Accounts,DC=",

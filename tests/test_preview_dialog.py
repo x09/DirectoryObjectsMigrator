@@ -176,6 +176,11 @@ def main():
     check("genuinely migrated scope says so",
           'already been migrated' in migrated, True)
 
+    mixed = note_for({**base_counts, 'ignored': 2}, 3,
+                     exists=[('CN=a,OU=X,DC=s,DC=alt', 'CN=a,OU=X,DC=d,DC=alt', 'user')])
+    check("existing plus skipped is not declared a complete migration",
+          'does not confirm a complete migration' in mixed, True)
+
     conflicted = note_for(base_counts, 1,
                           conflict=[('CN=b,OU=X,DC=s,DC=alt',
                                      'CN=b,OU=X,DC=d,DC=alt', 'user')])

@@ -104,7 +104,7 @@ class ProgressWindow(QDialog):
             message: Status message
         """
         self.progress_bar.setValue(percent)
-        self.status_label.setText(message)
+        self.status_label.setText(_(message))
 
         # Update phase label based on percent
         if percent < 20:

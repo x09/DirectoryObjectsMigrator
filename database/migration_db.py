@@ -37,7 +37,7 @@ class MigrationDB:
         'create_migration_run', 'update_migration_run', 'get_latest_run', 'get_run_by_id',
         'add_object', 'get_object_by_source_guid', 'get_object_by_source_dn',
         'get_object_by_dest_dn', 'add_deferred_reference', 'get_unresolved_references',
-        'mark_reference_resolved', 'update_reference_check', 'add_conflict',
+        'mark_reference_resolved', 'mark_reference_skipped', 'update_reference_check', 'add_conflict',
         'get_conflicts', 'log_error', 'get_errors', 'get_statistics', 'close',
         'counts', 'is_empty', 'backup', 'reset', 'vacuum',
         'for_direction', 'refresh_mapping', 'has_unassigned_history',
@@ -627,7 +627,7 @@ class MigrationDB:
         Returns:
             List of unresolved references
         """
-        clauses = ['resolved=0']
+        clauses = ["resolved=0", "COALESCE(notes, '') NOT LIKE 'SKIPPED:%'"]
         params = []
         if self.direction_id is not None:
             clauses.append('direction_id=?')
@@ -659,6 +659,19 @@ class MigrationDB:
                 resolution_timestamp = CURRENT_TIMESTAMP
             WHERE id = ? AND direction_id=?
         """, (dest_dn, run_id, ref_id, self._run_direction(run_id)))
+        self.connection.commit()
+
+    def mark_reference_skipped(self, ref_id: int, reason: str, run_id: int):
+        """Retain a non-resolved audit row, but remove it from the retry queue.
+
+        The existing notes field records the distinct SKIPPED disposition, so
+        older databases need no schema conversion. It is never marked resolved.
+        """
+        self.connection.execute("""
+            UPDATE deferred_references SET notes=?, resolution_run_id=?,
+                resolution_timestamp=CURRENT_TIMESTAMP
+            WHERE id=? AND direction_id=? AND resolved=0
+        """, ('SKIPPED: ' + reason, run_id, ref_id, self._run_direction(run_id)))
         self.connection.commit()
 
     def update_reference_check(self, ref_id: int):
@@ -774,7 +787,8 @@ class MigrationDB:
         cursor.execute("""
             SELECT COUNT(*) as total, SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END) as resolved
             FROM deferred_references
-            WHERE created_run_id = ? OR resolution_run_id = ?
+            WHERE (created_run_id = ? OR resolution_run_id = ?)
+              AND COALESCE(notes, '') NOT LIKE 'SKIPPED:%'
         """, (run_id, run_id))
         stats['deferred_references'] = dict(cursor.fetchone())
 

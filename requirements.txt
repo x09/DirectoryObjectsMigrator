@@ -1,4 +1,4 @@
-# Directory Objects Migrator v1.0
+# Directory Objects Migrator v1.3
 # Requirements for ALT Linux with system packages
 
 # LDAP connectivity

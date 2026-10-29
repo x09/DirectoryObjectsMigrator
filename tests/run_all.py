@@ -18,6 +18,8 @@ PROJECT_ROOT = TESTS_DIR.parent
 
 # Ordered so that fast, low-level checks fail first
 SUITES = [
+    ("Skipped references and DNS service groups", "test_skipped_references.py", False),
+    ("Background analysis and translated progress", "test_analysis_progress.py", True),
     ("Complete ranged LDAP reads", "test_ranged_reads.py", False),
     ("Password policy, fallback and outcomes", "test_password_fallback.py", True),
     ("Object, attribute and membership verification", "test_content_verification.py", False),

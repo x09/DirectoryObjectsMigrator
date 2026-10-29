@@ -1,18 +1,11 @@
 """
 Rules deciding which objects are skipped during a scan.
 
-The patterns in settings.IGNORED_DN_PATTERNS exist to keep built-in containers
-(CN=Users, CN=Builtin, CN=System, ...) out of a broad scan such as the whole
-domain. They are substring matches against the full DN, which caused a bug: when
-the operator explicitly asked to migrate CN=Users,DC=win,DC=test, the pattern
-"CN=Users,DC=" matched both that container *and everything inside it*, so every
-object was classified as ignored and the plan came out empty ("nothing to do").
-
-Explicit intent has to win. A pattern that matches the requested base DN is
-therefore disabled for that run, while all the other patterns stay active. Scanning
-the domain root still skips CN=Users; scanning CN=Users migrates its contents.
-
-Analyzer and Verifier both use this, so their counts stay comparable.
+CN=Users is not a subtree exclusion: ordinary users and groups in that container
+are eligible even when scanning the domain root. Built-in principals are still
+filtered by SID/system attributes. Containers themselves are not migrated.
+Other infrastructure DN patterns remain active unless explicitly selected as the
+base DN. Analyzer and Verifier share these rules.
 """
 from typing import List, Optional
 
@@ -232,7 +225,7 @@ class IgnoreRules:
             if str(oc).lower() in self.ignored_object_classes:
                 return True
 
-        if attributes and self.builtin_reason(attributes):
+        if attributes and (self.service_group_reason(dn, attributes) or self.builtin_reason(attributes)):
             return True
 
         return False
@@ -253,6 +246,24 @@ class IgnoreRules:
         if self.custom_exclusions and \
                 DNUtils.normalize_dn(dn or '') in self.custom_exclusions:
             return "excluded by operator (custom exclusion list)"
+        return None
+
+    @staticmethod
+    def service_group_reason(dn, attributes):
+        """DNS role groups in the default Users container; never classify by RID."""
+        classes = attributes.get('objectClass', [])
+        if isinstance(classes, str):
+            classes = [classes]
+        sam = attributes.get('sAMAccountName', '')
+        if isinstance(sam, list):
+            sam = sam[0] if sam else ''
+        cn = (DNUtils.extract_cn(dn) or '').casefold()
+        parent = DNUtils.get_parent_dn(dn) or ''
+        if ('group' in [str(c).lower() for c in classes]
+                and cn in ('dnsadmins', 'dnsupdateproxy')
+                and str(sam).casefold() == cn
+                and parent.upper().startswith('CN=USERS,DC=')):
+            return 'DNS service group managed by the destination domain'
         return None
 
     @staticmethod

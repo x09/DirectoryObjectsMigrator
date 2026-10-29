@@ -47,6 +47,7 @@ class MigrationPlan:
         self.skipped: List[tuple] = []  # objects excluded by ignore rules
         # (parent_dn, attribute, referenced_dn, resolvable_now)
         self.deferred: List[tuple] = []
+        self.skipped_references: List[tuple] = []
         self.ignored_count: int = 0
         self.unsupported_count: int = 0
         self.issues = {}  # source DN -> explanation shown in preview
@@ -169,7 +170,7 @@ class Migrator:
         self.reference_resolver = ReferenceResolver(
             source_conn, dest_conn, self.migration_db, logger,
             source_conn.domain_dn, dest_conn.domain_dn,
-            dry_run=dry_run
+            dry_run=dry_run, custom_exclusions=self.custom_exclusions
         )
         self.verifier = Verifier(source_conn, dest_conn, self.migration_db, logger,
                                  dry_run=dry_run,
@@ -373,6 +374,10 @@ class Migrator:
                     for ref_dn in values:
                         if not ref_dn:
                             continue
+                        skip_reason = self.reference_resolver.is_builtin_target(str(ref_dn))
+                        if skip_reason:
+                            plan.skipped_references.append((obj['dn'], attr, str(ref_dn), skip_reason))
+                            continue
                         if DNUtils.normalize_dn(str(ref_dn)) in planned_targets:
                             continue
                         try:
@@ -476,7 +481,7 @@ class Migrator:
                 e['severity'] in (settings.SEVERITY_ERROR, settings.SEVERITY_CRITICAL)
                 and e['phase'] in (settings.PHASE_REFERENCES, settings.PHASE_PASSWORD) for e in logged_errors)
             result.warnings.extend(e['error_message'] for e in logged_errors
-                                   if e['phase'] == settings.PHASE_PASSWORD and e['severity'] == settings.SEVERITY_WARNING)
+                                   if e['phase'] in (settings.PHASE_PASSWORD, settings.PHASE_REFERENCES) and e['severity'] == settings.SEVERITY_WARNING)
             if self.migration_db.get_unresolved_references():
                 result.warnings.append('Unresolved references remain')
         if self.migration_db.has_unassigned_history():

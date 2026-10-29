@@ -1,17 +1,4 @@
-"""
-Ignore rules: an explicitly requested built-in container must be migrated.
-
-Reported bug: analysing CN=Users,DC=win,DC=test produced "nothing to do - everything
-in this scope is already migrated" even though nothing had been migrated. The
-pattern "CN=Users,DC=" in settings.IGNORED_DN_PATTERNS is a substring match against
-the full DN, so it matched the requested container *and every object inside it*.
-Everything landed in `ignored`, the plan came out empty, and the message was
-misleading on top of that.
-
-The rule now is: a pattern matching the requested base DN is disabled for that run,
-because asking for the container is an explicit statement of intent. Every other
-pattern stays active, so scanning the domain root still skips CN=Users.
-"""
+"""Root scans include ordinary CN=Users objects and still exclude infrastructure."""
 import sys
 import tempfile
 from pathlib import Path
@@ -40,10 +27,10 @@ def test_rules_directly():
     print("\n=== Scanning the whole domain still skips built-in containers ===")
     broad = IgnoreRules(base_dn='DC=win,DC=test')
 
-    check("CN=Users container ignored",
-          broad.should_ignore('CN=Users,DC=win,DC=test', ['container']), True)
-    check("object inside CN=Users ignored",
-          broad.should_ignore('CN=Ivan,CN=Users,DC=win,DC=test', ['user']), True)
+    check("CN=Users not excluded by path",
+          broad.should_ignore('CN=Users,DC=win,DC=test', ['container']), False)
+    check("ordinary user in CN=Users not excluded",
+          broad.should_ignore('CN=Ivan,CN=Users,DC=win,DC=test', ['user']), False)
     check("CN=Builtin ignored",
           broad.should_ignore('CN=Builtin,DC=win,DC=test', ['container']), True)
     check("a normal OU is not ignored",
@@ -67,8 +54,8 @@ def test_rules_directly():
           explicit.should_ignore('CN=Builtin,DC=win,DC=test', ['container']), True)
     check("CN=System still ignored",
           explicit.should_ignore('CN=System,DC=win,DC=test', ['container']), True)
-    check("the override is reported for the log",
-          'CN=Users,DC=' in explicit.describe_overrides(), True)
+    check("CN=Users needs no override",
+          'CN=Users,DC=' in explicit.describe_overrides(), False)
 
     print("\n=== Case insensitivity ===")
     lower = IgnoreRules(base_dn='cn=users,dc=win,dc=test')
@@ -139,11 +126,11 @@ def test_end_to_end():
     check("computer was not migrated",
           dst.object_exists(f'CN=WORKSTATION1,CN=Users,{DST}'), False)
 
-    print("\n=== Scanning the domain root still skips CN=Users ===")
+    print("\n=== Scanning the domain root includes ordinary CN=Users objects ===")
     root_analysis = Analyzer(src, logger=logger).analyze(SRC, include_references=True)
-    check("no users picked up from CN=Users",
-          root_analysis.counts_by_type['user'], 0)
-    check("CN=Users contents reported as ignored",
+    check("ordinary users picked up from CN=Users",
+          root_analysis.counts_by_type['user'], 2)
+    check("computer remains ignored",
           root_analysis.counts_by_type['ignored'] > 0, True)
 
     db.close()
@@ -298,7 +285,64 @@ def test_builtin_end_to_end():
     db.close()
 
 
+def test_root_recovers_previously_deferred_users():
+    """An old root run omitted Users; the next run must repair its memberships."""
+    from unittest.mock import patch
+    from config import settings
+    src_root, dst_root = 'DC=cikrf,DC=cp', 'DC=altdomain,DC=loc'
+    src, dst = FakeLDAPConnector('cikrf.cp'), FakeLDAPConnector('altdomain.loc')
+    src.seed(src_root, ['domain'])
+    dst.seed(dst_root, ['domain'])
+    src.seed('CN=Users,' + src_root, ['container'])
+    dst.seed('CN=Users,' + dst_root, ['container'])
+    src.seed('OU=medo,' + src_root, ['organizationalUnit'], ou='medo')
+    members = []
+    for index in range(7):
+        dn = f'CN=user{index},OU=medo,{src_root}'
+        src.seed(dn, ['user'], cn=f'user{index}', sAMAccountName=f'user{index}')
+        members.append(dn)
+    for name in ('medo', 'test123'):
+        dn = f'CN={name},CN=Users,{src_root}'
+        src.seed(dn, ['user'], cn=name, sAMAccountName=name, objectSid=make_sid(2100 + len(members)))
+        members.append(dn)
+    src.seed('CN=Administrator,CN=Users,' + src_root, ['user'], objectSid=make_sid(500))
+    src.seed('CN=HOST,CN=Users,' + src_root, ['computer'])
+    src.seed('CN=foreign,CN=ForeignSecurityPrincipals,' + src_root, ['foreignSecurityPrincipal'])
+    group = 'CN=medousers,OU=medo,'
+    src.seed(group + src_root, ['group'], cn='medousers', sAMAccountName='medousers',
+             groupType=-2147483646, member=members)
+    with tempfile.TemporaryDirectory() as tmp:
+        db = MigrationDB(Path(tmp) / 'state.db')
+        logger = MigrationLogger(log_file=Path(tmp) / 'migration.log')
+        logger.set_log_level('ERROR')
+        def migrator(**kw):
+            return Migrator(source_conn=src, dest_conn=dst, migration_db=db, logger=logger, **kw)
+        with patch.object(settings, 'IGNORED_DN_PATTERNS', settings.IGNORED_DN_PATTERNS + ['CN=Users,DC=']):
+            migrator().migrate(src_root)
+        check('old root run leaves seven members', len(dst.members_of(group + dst_root)), 7)
+        check('old root run leaves two deferred links', len(db.get_unresolved_references()), 2)
+        analysis = Analyzer(src).analyze(src_root)
+        plan = migrator().build_plan(analysis)
+        check('root preview offers the two missing users', plan.summary()['create'], 2)
+        migrator(dry_run=True).migrate(src_root)
+        check('dry run retains deferred links', len(db.get_unresolved_references()), 2)
+        check('dry run does not create user', dst.object_exists('CN=medo,CN=Users,' + dst_root), False)
+        result = migrator().migrate(src_root)
+        check('root rerun creates exactly two users', result.objects_created, 2)
+        check('all nine group DNs restored', set(dst.members_of(group + dst_root)),
+              {dn.replace(src_root, dst_root) for dn in members})
+        check('resolved links removed from pending', len(db.get_unresolved_references()), 0)
+        check('builtin administrator still skipped', dst.object_exists('CN=Administrator,CN=Users,' + dst_root), False)
+        check('computer still skipped', dst.object_exists('CN=HOST,CN=Users,' + dst_root), False)
+        check('foreign principal still skipped', dst.object_exists('CN=foreign,CN=ForeignSecurityPrincipals,' + dst_root), False)
+        check('repeat run creates nothing', migrator().migrate(src_root).objects_created, 0)
+        excluded = IgnoreRules(src_root, custom_exclusions=[members[-1]])
+        check('custom exclusion still wins', excluded.should_ignore(members[-1], ['user']), True)
+        db.close()
+
+
 def main():
+    test_root_recovers_previously_deferred_users()
     test_rules_directly()
     test_end_to_end()
     test_builtin_principals()

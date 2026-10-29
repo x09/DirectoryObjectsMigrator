@@ -28,7 +28,8 @@ class ReferenceResolver:
         logger: MigrationLogger,
         source_domain_dn: str,
         dest_domain_dn: str,
-        dry_run: bool = False
+        dry_run: bool = False,
+        custom_exclusions=None
     ):
         """
         Initialize reference resolver
@@ -50,28 +51,17 @@ class ReferenceResolver:
         self.source_domain_dn = source_domain_dn
         self.dest_domain_dn = dest_domain_dn
         self.dry_run = dry_run
+        self.exclusion_rules = IgnoreRules(custom_exclusions=custom_exclusions)
         # source DN -> reason string, or '' meaning "checked, not built-in".
         # Group members repeat heavily across groups, so caching avoids re-reading
         # the same source object once per membership.
         self._builtin_cache: Dict[str, str] = {}
 
     def is_builtin_target(self, source_dn: str) -> Optional[str]:
-        """
-        Check whether a referenced object is a built-in principal.
+        """Return an exclusion/unsupported reason, or None for a retryable target.
 
-        Such objects are deliberately never migrated (krbtgt, Administrator,
-        Domain Admins and so on), so a reference to one must be dropped rather than
-        deferred: deferring it would leave a row that can never be resolved,
-        cluttering every subsequent report with permanently pending work.
-
-        The source object is read to obtain its objectSid, because the RID is what
-        identifies a built-in principal independently of the domain's language.
-
-        Args:
-            source_dn: DN of the referenced object in the source domain
-
-        Returns:
-            A short reason for the log, or None if the target is a normal object
+        Kept under its original name for callers. Missing/unreadable objects are
+        not classified as skipped; they remain eligible for deferred retry.
         """
         cached = self._builtin_cache.get(source_dn)
         if cached is not None:
@@ -87,7 +77,18 @@ class ReferenceResolver:
                 attributes=['objectSid', 'sAMAccountName', 'cn', 'objectClass',
                             'isCriticalSystemObject', 'systemFlags'])
             if entry:
-                reason = IgnoreRules.builtin_reason(entry['attributes'])
+                attrs = entry['attributes']
+                reason = self.exclusion_rules.exclusion_reason(source_dn)
+                reason = reason or IgnoreRules.service_group_reason(entry['dn'], attrs)
+                reason = reason or IgnoreRules.builtin_reason(attrs)
+                classes = attrs.get('objectClass', [])
+                if isinstance(classes, str):
+                    classes = [classes]
+                classes = {str(c).lower() for c in classes}
+                if not reason and (classes & {'computer', 'foreignsecurityprincipal'}):
+                    reason = 'unsupported reference target type: ' + ', '.join(sorted(classes & {'computer', 'foreignsecurityprincipal'}))
+                if not reason and classes and not classes & {'user', 'group', 'contact', 'organizationalunit'}:
+                    reason = 'unsupported reference target type: ' + ', '.join(sorted(classes))
         except Exception as e:
             # Unreadable target: fall through and let the normal deferral logic
             # handle it rather than guessing
@@ -96,6 +97,15 @@ class ReferenceResolver:
         # '' marks "checked, not built-in" so the negative result is cached too
         self._builtin_cache[source_dn] = reason or ''
         return reason
+
+    def record_skipped(self, parent_dn, attr_name, source_dn, reason, run_id, ref_id=None):
+        message = f'Skipped reference: {attr_name}: {source_dn}; {reason}'
+        self.logger.warning(message)
+        if not self.dry_run:
+            if ref_id is not None:
+                self.migration_db.mark_reference_skipped(ref_id, reason, run_id)
+            self.migration_db.log_error(run_id, settings.SEVERITY_WARNING,
+                settings.PHASE_REFERENCES, message, object_dn=parent_dn)
 
     def existing_values(self, parent_dn: str, attr_name: str) -> Set[str]:
         """
@@ -199,6 +209,12 @@ class ReferenceResolver:
             already_set = self.existing_values(parent_dn, attr_name)
 
             for ref_dn in ref_dns:
+                reason = self.is_builtin_target(ref_dn)
+                if reason:
+                    stats['skipped'] += 1
+                    member_status.append((DNUtils.extract_cn(ref_dn) or ref_dn, 'SKIPPED'))
+                    self.record_skipped(parent_dn, attr_name, ref_dn, reason, run_id)
+                    continue
                 # Try to resolve
                 try:
                     dest_ref_dn = self.resolve_reference(ref_dn)
@@ -219,17 +235,6 @@ class ReferenceResolver:
                     stats['resolved'] += 1
                     member_status.append((name, 'ADDED'))
                 else:
-                    # A reference to a built-in principal can never resolve, because
-                    # such objects are deliberately never migrated. Deferring it
-                    # would leave a permanently pending row in every later report.
-                    builtin = self.is_builtin_target(ref_dn)
-                    if builtin:
-                        stats['skipped'] = stats.get('skipped', 0) + 1
-                        member_status.append((name, 'SKIPPED'))
-                        self.logger.debug(
-                            f"Reference {attr_name} -> {ref_dn} dropped: {builtin}")
-                        continue
-
                     # Not found - defer it
                     deferred_dns.append(ref_dn)
                     stats['deferred'] += 1
@@ -309,7 +314,7 @@ class ReferenceResolver:
             elif status == 'SKIPPED':
                 # A built-in principal, intentionally not migrated. Informational,
                 # not a problem, so it must not be logged as an error.
-                self.logger.info(f"    {name}: {status} (built-in)")
+                self.logger.warning(f"    {name}: {status}")
             else:
                 self.logger.error(f"    {name}: {status}")
 
@@ -351,6 +356,25 @@ class ReferenceResolver:
                 name = DNUtils.extract_cn(source_dn) or source_dn
                 if not self.dry_run:
                     self.migration_db.update_reference_check(ref['id'])
+                # Resolve the stored source identity before classifying a renamed
+                # target. A replacement at its old DN must not retire this row.
+                target_dn = source_dn
+                target_guid = ref.get('referenced_source_guid')
+                if target_guid:
+                    try:
+                        target = self.source_conn.get_object_by_guid(target_guid, base_dn=self.source_domain_dn)
+                        if target is None or guid_text(target['attributes'].get('objectGUID')) != guid_text(target_guid):
+                            raise MappingValidationError('Deferred target identity not found')
+                        target_dn = target['dn']
+                    except Exception as exc:
+                        self.logger.warning(f'Cannot classify deferred target {source_dn}: {exc}')
+                        still_deferred_count += 1
+                        continue
+                reason = self.is_builtin_target(target_dn)
+                if reason:
+                    self.record_skipped(parent_dn, attr_name, target_dn, reason, run_id, ref['id'])
+                    member_status.append((name, 'SKIPPED'))
+                    continue
                 try:
                     dest_dn = self.resolve_reference(source_dn, ref.get('referenced_source_guid'))
                 except Exception as exc:
@@ -364,10 +388,6 @@ class ReferenceResolver:
                         member_status.append((name, 'PRESENT'))
                     else:
                         pending.append((ref, dest_dn, name))
-                elif self.is_builtin_target(source_dn):
-                    if not self.dry_run:
-                        self.migration_db.mark_reference_resolved(ref['id'], '', run_id)
-                    member_status.append((name, 'SKIPPED'))
                 else:
                     still_deferred_count += 1
                     member_status.append((name, 'DEFERRED'))

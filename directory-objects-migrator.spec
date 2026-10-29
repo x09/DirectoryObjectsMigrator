@@ -1,8 +1,8 @@
 %define _unpackaged_files_terminate_build 1
 
 Name: DirectoryObjectsMigrator
-Version: 1.2
-Release: alt1.git917c9bc
+Version: 1.3
+Release: alt1
 Summary: A tool for migrating Active Directory objects from Microsoft AD to Samba AD
 License: %gpl3only
 Group: System/Configuration/Other
@@ -75,6 +75,13 @@ chmod 755 %buildroot/%_bindir/%name
 
 
 %changelog
+* Thu Oct 29 2026 Anton Shevtsov <shevtsov.anton@gmail.com> 1.3-alt1
+- Exclude DNS service groups and report unsupported references as skipped.
+- Preserve skipped-reference history without treating it as resolved.
+- Include ordinary CN=Users objects in domain-root migrations.
+- Run analysis and migration planning in the background with a busy indicator.
+- Fix migration progress translations and preview completion messages.
+
 * Wed Oct 28 2026 Anton Shevtsov <shevtsov.anton@gmail.com> 1.2-alt1.git917c9bc
 - Add paged LDAP searches and complete large-group member retrieval.
 - Validate destination parents, object identities and naming conflicts.

@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QTextCursor
 
+from gui.analysis_dialog import AnalysisDialog, AnalysisWorker
 from gui.connection_dialog import ConnectionDialog
 from gui.branch_dialog import BranchDialog
 from gui.preview_dialog import PreviewDialog
@@ -516,17 +517,45 @@ class MainWindow(QMainWindow):
             self._ensure_dest_connected()
 
             from core.analyzer import Analyzer
-            # A logger is passed so the analyzer can report when an ignore rule is
-            # disabled because the requested base DN is a built-in container.
-            if self.logger is None:
-                self.logger = MigrationLogger(gui_callback=self._append_log)
-            analyzer = Analyzer(self.source_conn, logger=self.logger)
-            self.analysis_result = analyzer.analyze(base_dn, include_references=True)
-
-            # Build the plan with the same settings the run will use, so the
-            # preview and the migration agree.
+            self.analysis_result = None
+            self.migration_plan = None
+            self.migrate_btn.setEnabled(False)
             self.migration_db = self.migration_db or MigrationDB()
-            self.migration_plan = self._build_plan(base_dn)
+            source, dest, database = self.source_conn, self.dest_conn, self.migration_db
+            opts = self.config_manager.get_migration_config()
+            exclusions = self.config_manager.get_custom_exclusions()
+
+            def analyze_and_plan(worker):
+                # No widgets or UI callbacks are accessed on the worker thread.
+                analysis = Analyzer(source, logger=logger).analyze(
+                    base_dn, include_references=True)
+                worker.stage_changed.emit(_("Checking destination objects and building migration plan..."))
+                planner = Migrator(
+                    source_conn=source, dest_conn=dest, migration_db=database,
+                    logger=logger, dry_run=True, custom_exclusions=exclusions,
+                    password_mode=opts.get('password_mode', settings.DEFAULT_PASSWORD_MODE),
+                    fixed_password=opts.get('fixed_password', ''),
+                    password_length=opts.get('password_length', settings.DEFAULT_PASSWORD_LENGTH),
+                    batch_size=opts.get('batch_size', settings.DEFAULT_BATCH_SIZE))
+                return analysis, planner.build_plan(analysis)
+
+            worker = AnalysisWorker(analyze_and_plan, self)
+            worker.log_message.connect(self._append_log)
+            logger = MigrationLogger(gui_callback=worker.log_message.emit)
+            self.logger = logger
+            dialog = AnalysisDialog(worker, self)
+            worker.start()
+            try:
+                dialog.exec_()
+                worker.wait()
+                if worker.error is not None:
+                    raise worker.error
+                self.analysis_result, self.migration_plan = worker.result
+            finally:
+                worker.wait()
+                logger.gui_callback = self._append_log
+                dialog.deleteLater()
+                worker.deleteLater()
 
         except Exception as e:
             self.analysis_result = None

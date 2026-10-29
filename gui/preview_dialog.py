@@ -85,8 +85,12 @@ class PreviewDialog(QDialog):
             [_("Object"), _("Attribute"), _("Referenced object"), _("Status")])
         self.tabs.addTab(self._wrap(self.deferred_table), _("Deferred references"))
 
+        self.skipped_references_table = self._make_table(
+            [_("Object"), _("Attribute"), _("Referenced object"), _("Reason")])
+
         self.counts_table = self._make_table([_("Object Type"), _("Count")])
         self.tabs.addTab(self._wrap(self.counts_table), _("Objects found"))
+        self.tabs.addTab(self._wrap(self.skipped_references_table), _("Skipped references"))
 
         layout.addWidget(self.tabs)
 
@@ -191,6 +195,13 @@ class PreviewDialog(QDialog):
         self.tabs.setTabText(0, f"{_('Planned actions')} ({len(rows)})")
 
     def _populate_deferred_table(self):
+        skipped = self.plan.skipped_references
+        self.skipped_references_table.setRowCount(len(skipped))
+        for row, values in enumerate(skipped):
+            for col, value in enumerate(values):
+                self.skipped_references_table.setItem(row, col, QTableWidgetItem(str(value)))
+        self.skipped_references_table.resizeColumnsToContents()
+
         # Show only references that will remain deferred after this run.
         # Resolvable references are handled during migration and don't need to be
         # tracked separately in the UI.
@@ -255,6 +266,10 @@ class PreviewDialog(QDialog):
                 f"<b style='color:#C62828;'>{s['errors']} {_('ERROR')}</b>: " +
                 _("Identity could not be verified. Missing, replaced or unreadable tracked objects are skipped; see the Reason column."))
 
+        if self.plan.skipped_references:
+            notes.append(str(len(self.plan.skipped_references)) + " " +
+                         _("references will be skipped because their targets are unsupported or excluded. See the Skipped references tab; retrying will not transfer them."))
+
         if s['deferred']:
             resolvable = s['deferred_resolvable_now']
             notes.append(
@@ -291,7 +306,7 @@ class PreviewDialog(QDialog):
         if summary['exists']:
             # Genuinely idempotent: the objects are tracked in the migration database
             return ("<b>" + _("Nothing to create") + "</b>: " +
-                    _("every object in this scope has already been migrated."))
+                    _("objects marked EXISTS have already been migrated. Skipped objects, conflicts and deferred references are listed separately; this does not confirm a complete migration of the scope."))
 
         if self.analysis_result.total_objects == 0:
             return ("<b>" + _("Nothing found") + "</b>: " +
