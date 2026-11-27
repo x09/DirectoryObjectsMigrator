@@ -60,7 +60,7 @@ class BranchDialog(QDialog):
     """Return one server-supplied DN; all widgets are touched on the GUI thread."""
     connection_failed = pyqtSignal()
 
-    def __init__(self, connection_params, parent=None, connector_factory=LDAPConnector):
+    def __init__(self, connection_params, parent=None, connector_factory=LDAPConnector, destination=False):
         super().__init__(parent)
         self.setWindowTitle(_("Select migration branch"))
         self.resize(720, 520)
@@ -72,7 +72,8 @@ class BranchDialog(QDialog):
         self.domain_dn = ','.join('DC=' + part for part in connection_params['domain'].split('.'))
 
         layout = QVBoxLayout(self)
-        description = QLabel(_("Select one branch of the source domain. All nested objects are included."))
+        description = QLabel(_("Select an existing destination OU or container.") if destination else
+                             _("Select one branch of the source domain. All nested objects are included."))
         description.setWordWrap(True)
         layout.addWidget(description)
         self.tree = QTreeWidget()

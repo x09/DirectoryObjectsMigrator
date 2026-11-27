@@ -5,9 +5,9 @@ Main application window
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QCheckBox, QTextEdit, QGroupBox, QMenuBar, QMenu, QAction,
-    QStatusBar, QMessageBox, QFileDialog, QInputDialog
+    QStatusBar, QMessageBox, QFileDialog, QInputDialog, QDialog
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon, QTextCursor
 
 from gui.analysis_dialog import AnalysisDialog, AnalysisWorker
@@ -16,6 +16,7 @@ from gui.branch_dialog import BranchDialog
 from gui.preview_dialog import PreviewDialog
 from gui.progress_window import ProgressWindow, completion_title
 
+from core.sources import source_connector_class
 from core.ldap_connector import LDAPConnector, LDAPConnectionError
 from core.migrator import Migrator, MigrationResult
 from core.analyzer import AnalysisResult
@@ -73,6 +74,27 @@ class MigrationWorker(QThread):
             self.migration_complete.emit(False, None)
 
 
+class FreeIPAMigrationWorker(MigrationWorker):
+    def __init__(self, operation, parent=None):
+        super().__init__('', parent)
+        self.operation = operation
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+        if self.migrator:
+            self.migrator.cancel()
+
+    def run(self):
+        try:
+            result = self.operation(self)
+            self.migration_complete.emit(result.success, result)
+        except Exception as exc:
+            result = MigrationResult(status=settings.RUN_STATUS_FAILED,
+                                     errors_count=1, failure_message=str(exc))
+            self.migration_complete.emit(False, result)
+
+
 class MainWindow(QMainWindow):
     """Main application window"""
 
@@ -125,13 +147,13 @@ class MainWindow(QMainWindow):
         status_group = QGroupBox(_("Connection Status"))
         status_layout = QHBoxLayout()
 
-        self.source_status = QLabel("Source DC: " + _("Not connected"))
+        self.source_status = QLabel(_("Source:") + " " + _("Not connected"))
         self.source_status.setStyleSheet("color: red;")
         status_layout.addWidget(self.source_status)
 
         status_layout.addStretch()
 
-        self.dest_status = QLabel("Destination DC: " + _("Not connected"))
+        self.dest_status = QLabel(_("Destination:") + " " + _("Not connected"))
         self.dest_status.setStyleSheet("color: red;")
         status_layout.addWidget(self.dest_status)
 
@@ -143,7 +165,9 @@ class MainWindow(QMainWindow):
         settings_layout = QVBoxLayout()
 
         # Base DN
-        base_dn_layout = QHBoxLayout()
+        self.base_dn_row = QWidget()
+        base_dn_layout = QHBoxLayout(self.base_dn_row)
+        base_dn_layout.setContentsMargins(0, 0, 0, 0)
         base_dn_layout.addWidget(QLabel(_("Base DN for Migration") + ":"))
         self.base_dn_input = QLineEdit()
         self.base_dn_input.setPlaceholderText("OU=Users,DC=domain,DC=alt")
@@ -155,7 +179,10 @@ class MainWindow(QMainWindow):
         self.browse_base_dn_btn.clicked.connect(self._browse_base_dn)
         base_dn_layout.addWidget(self.browse_base_dn_btn)
         self.base_dn_input.textChanged.connect(self._invalidate_analysis)
-        settings_layout.addLayout(base_dn_layout)
+        settings_layout.addWidget(self.base_dn_row)
+        self.freeipa_scope_label = QLabel(_("FreeIPA: users and groups from the accounts tree. Destination containers are configured in connection settings."))
+        self.freeipa_scope_label.setWordWrap(True)
+        settings_layout.addWidget(self.freeipa_scope_label)
 
         # Options
         options_layout = QHBoxLayout()
@@ -267,6 +294,8 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         """Open settings dialog"""
+        previous_database = self.config_manager.get_database_path()
+        previous_mappings = self.config_manager.get_freeipa_mappings()
         previous_configs = {
             'source': self.config_manager.get_source_dc_config(),
             'dest': self.config_manager.get_dest_dc_config(),
@@ -276,6 +305,10 @@ class MainWindow(QMainWindow):
         dialog.database_reset.connect(self._on_database_reset)
 
         if dialog.exec_() == ConnectionDialog.Accepted:
+            if self.config_manager.get_freeipa_mappings() != previous_mappings:
+                self._invalidate_analysis()
+            if self.config_manager.get_database_path() != previous_database:
+                self._history_changed()
             for dc_type, current in (
                 ('source', self.config_manager.get_source_dc_config()),
                 ('dest', self.config_manager.get_dest_dc_config()),
@@ -416,16 +449,14 @@ class MainWindow(QMainWindow):
         about_text = f"""
 <h2>{_("Directory Objects Migrator")}</h2>
 <p><b>{_("Version")}:</b> {settings.APP_VERSION}</p>
-<p>{_("Migration tool for Active Directory objects")}</p>
-<p>Microsoft Active Directory → Samba AD</p>
+<p>{_("Directory service object migrator (AD/FreeIPA) to Samba AD")}</p>
 <br>
 <p><b>{_("Features")}:</b></p>
 <ul>
-<li>Migrate OUs, Users, Groups, Contacts</li>
-<li>Idempotent migration (safe to re-run)</li>
-<li>Deferred reference resolution</li>
-<li>Batch processing</li>
-<li>Dry-run mode</li>
+<li>{_("AD: organizational units, users, groups and contacts")}</li>
+<li>{_("FreeIPA: users and groups, optional RFC2307")}</li>
+<li>{_("Migration preview, identity tracking and verification")}</li>
+<li>{_("Deferred references and dry-run mode")}</li>
 </ul>
 <br>
 <p><b>GitHub:</b> <a href="https://github.com/x09/DirectoryObjectsMigrator">https://github.com/x09/DirectoryObjectsMigrator</a></p>
@@ -441,22 +472,28 @@ class MainWindow(QMainWindow):
         dest_ok = bool(dest_config.get('host') and dest_config.get('domain'))
 
         if source_ok:
-            self.source_status.setText(f"Source DC: {source_config['host']} ({source_config['domain']})")
+            self.source_status.setText(_("Source:") + f" {source_config['host']} ({source_config['domain']})")
             self.source_status.setStyleSheet("color: green;")
         else:
-            self.source_status.setText("Source DC: " + _("Not configured"))
+            self.source_status.setText(_("Source:") + " " + _("Not configured"))
             self.source_status.setStyleSheet("color: red;")
 
         if dest_ok:
-            self.dest_status.setText(f"Destination DC: {dest_config['host']} ({dest_config['domain']})")
+            self.dest_status.setText(_("Destination:") + f" {dest_config['host']} ({dest_config['domain']})")
             self.dest_status.setStyleSheet("color: green;")
         else:
-            self.dest_status.setText("Destination DC: " + _("Not configured"))
+            self.dest_status.setText(_("Destination:") + " " + _("Not configured"))
             self.dest_status.setStyleSheet("color: red;")
 
         # Enable analyze button if both configured
-        self.analyze_btn.setEnabled(source_ok and dest_ok)
-        self.browse_base_dn_btn.setEnabled(source_ok)
+        ipa = source_config.get('source_type', 'ad') == 'freeipa'
+        self.analyze_btn.setEnabled(source_ok and (ipa or dest_ok))
+        self.browse_base_dn_btn.setEnabled(source_ok and not ipa)
+        self.base_dn_input.setEnabled(not ipa)
+        self.base_dn_row.setVisible(not ipa)
+        self.freeipa_scope_label.setVisible(ipa)
+        if ipa and source_ok:
+            self.source_status.setText(f"FreeIPA: {source_config['host']} ({source_config['domain']})")
 
     def _invalidate_analysis(self, *args):
         """A plan applies only to the scope against which it was built."""
@@ -498,6 +535,9 @@ class MainWindow(QMainWindow):
 
     def _analyze(self):
         """Analyze source domain"""
+        if self.config_manager.get_source_dc_config().get('source_type', 'ad') == 'freeipa':
+            self._analyze_freeipa()
+            return
         base_dn = self.base_dn_input.text().strip()
         if not base_dn:
             QMessageBox.warning(self, _("Error"), _("Please specify Base DN"))
@@ -520,7 +560,7 @@ class MainWindow(QMainWindow):
             self.analysis_result = None
             self.migration_plan = None
             self.migrate_btn.setEnabled(False)
-            self.migration_db = self.migration_db or MigrationDB()
+            self.migration_db = self.migration_db or MigrationDB(self.config_manager.get_database_path())
             source, dest, database = self.source_conn, self.dest_conn, self.migration_db
             opts = self.config_manager.get_migration_config()
             exclusions = self.config_manager.get_custom_exclusions()
@@ -591,6 +631,172 @@ class MainWindow(QMainWindow):
             self._start_migration()
         else:
             self.statusBar.showMessage(_("Analysis complete"))
+
+    def _freeipa_operation(self, approved_plan=None, recreation_requests=None):
+        """Capture settings on the GUI thread; connections belong to the worker."""
+        from core.freeipa_migration import FreeIPAMigrator
+        source_config = self.config_manager.get_source_dc_config()
+        dest_config = self.config_manager.get_dest_dc_config()
+        params = []
+        for kind, config in [('source', source_config), ('dest', dest_config)]:
+            password = self._get_password(kind, config['host'], config['domain'], config['username'])
+            params.append(dict(host=config['host'], port=config['port'], domain=config['domain'],
+                               username=config['username'], password=password, use_tls=config['use_tls']))
+        opts = self.config_manager.get_migration_config()
+        exclusions = self.config_manager.get_custom_exclusions()
+        dry_run = self.dry_run_checkbox.isChecked()
+        log_level = self.config_manager.get_log_level()
+        database_path = self.config_manager.get_database_path()
+        attribute_mappings = self.config_manager.get_freeipa_mappings()
+        def operation(worker):
+            source = source_connector_class('freeipa')(**params[0])
+            dest = LDAPConnector(**params[1])
+            database = None
+            logger = MigrationLogger(gui_callback=worker.log_message.emit)
+            logger.set_log_level(log_level)
+            try:
+                source.connect()
+                dest.connect()
+                database = MigrationDB(database_path)
+                progress = (worker.emit_progress if approved_plan is not None else
+                            lambda percent, message: worker.stage_changed.emit(message))
+                migrator = FreeIPAMigrator(source, dest, database, logger,
+                    source_config.get('users_target_dn') or 'CN=Users,' + dest.domain_dn,
+                    source_config.get('groups_target_dn') or 'CN=Users,' + dest.domain_dn,
+                    rfc2307=source_config.get('rfc2307', False), custom_exclusions=exclusions,
+                    shorten_long_logins=source_config.get('shorten_long_logins', False),
+                    password_mode=opts.get('password_mode', 'random'),
+                    fixed_password=opts.get('fixed_password', ''),
+                    password_length=opts.get('password_length', settings.DEFAULT_PASSWORD_LENGTH),
+                    dry_run=dry_run, progress_callback=progress, approved_plan=approved_plan,
+                    recreation_requests=recreation_requests, attribute_mappings=attribute_mappings)
+                if approved_plan is None:
+                    return migrator.build_plan()
+                worker.migrator = migrator
+                if worker.cancelled:
+                    migrator.cancel()
+                return migrator.migrate()
+            finally:
+                source.disconnect()
+                dest.disconnect()
+                if database:
+                    database.close()
+        return operation
+
+    def _analyze_freeipa(self, recreation_requests=None):
+        from gui.freeipa_discovery import FreeIPADiscoveryDialog, FreeIPAPlanDialog
+        self._invalidate_analysis()
+        config = self.config_manager.get_source_dc_config()
+        dest = self.config_manager.get_dest_dc_config()
+        planning = all(dest.get(key) for key in ('host', 'domain', 'username'))
+        worker = dialog = None
+        action = QDialog.Rejected
+        selected_dns = []
+        requested_recreations = {}
+        try:
+            if planning:
+                operation = (self._freeipa_operation(recreation_requests=recreation_requests)
+                             if recreation_requests else self._freeipa_operation())
+            else:
+                password = self._get_password('source', config['host'], config['domain'], config['username'])
+                exclusions = self.config_manager.get_custom_exclusions()
+                def operation(worker):
+                    conn = source_connector_class('freeipa')(
+                        host=config['host'], port=config['port'], domain=config['domain'],
+                        username=config['username'], password=password, use_tls=config['use_tls'])
+                    try:
+                        conn.connect()
+                        return conn.discover(config.get('rfc2307', False), exclusions)
+                    finally:
+                        conn.disconnect()
+            worker = AnalysisWorker(operation, self)
+            worker.log_message.connect(self._append_log)
+            dialog = AnalysisDialog(worker, self)
+            worker.start()
+            dialog.exec_()
+            worker.wait()
+            if worker.error:
+                raise worker.error
+            if planning:
+                self.migration_plan = worker.result
+                self.migrate_btn.setEnabled(not self.migration_plan.blocked)
+                preview = FreeIPAPlanDialog(self.migration_plan, self.dry_run_checkbox.isChecked(), self,
+                                            history_path=self.config_manager.get_database_path())
+                action = preview.exec_()
+                selected_dns = preview.excluded_dns
+                requested_recreations = preview.requested_recreations
+                preview.deleteLater()
+            else:
+                FreeIPADiscoveryDialog(worker.result, self).exec_()
+            self.statusBar.showMessage(_("Analysis complete"))
+        except Exception as exc:
+            self._invalidate_analysis()
+            if isinstance(exc, LDAPConnectionError):
+                self._session_passwords = {'source': None, 'dest': None}
+            QMessageBox.critical(self, _("Analysis failed"), str(exc))
+        finally:
+            if worker:
+                worker.wait()
+                worker.deleteLater()
+            if dialog:
+                dialog.deleteLater()
+        if action == QDialog.Accepted:
+            self._start_freeipa_migration()
+        elif action == FreeIPAPlanDialog.RECREATE_AND_REANALYZE:
+            self._invalidate_analysis()
+            QTimer.singleShot(0, lambda: self._analyze_freeipa(requested_recreations))
+        elif action == FreeIPAPlanDialog.EXCLUDE_AND_REANALYZE:
+            self.config_manager.set_custom_exclusions(self.config_manager.get_custom_exclusions() + selected_dns)
+            self._invalidate_analysis()
+            QTimer.singleShot(0, self._analyze_freeipa)
+        elif action == FreeIPAPlanDialog.OPEN_SETTINGS:
+            self._open_settings()
+        elif action == FreeIPAPlanDialog.CHOOSE_HISTORY:
+            if self._choose_history():
+                QTimer.singleShot(0, self._analyze_freeipa)
+
+    def _history_changed(self):
+        if self.migration_db:
+            self.migration_db.close()
+            self.migration_db = None
+        self.last_run_id = None
+        self.report_btn.setEnabled(False)
+        self._invalidate_analysis()
+
+    def _choose_history(self):
+        from gui.migration_table import choose_history_file
+        path = choose_history_file(self, self.config_manager.get_database_path())
+        if path:
+            self.config_manager.set_database_path(path)
+            self._history_changed()
+            return True
+        return False
+
+    def _start_freeipa_migration(self):
+        if self.migration_plan is None or self.migration_plan.blocked:
+            QMessageBox.warning(self, _("Error"), _("Please run analysis first"))
+            return
+        try:
+            operation = self._freeipa_operation(self.migration_plan)
+            progress = ProgressWindow(self)
+            worker = FreeIPAMigrationWorker(operation, self)
+            self.migration_worker = worker
+            # Reports use their own DB connection; the worker owns and closes its connection.
+            if self.migration_db:
+                self.migration_db.close()
+            self.migration_db = MigrationDB(self.config_manager.get_database_path())
+            worker.progress_update.connect(progress.update_progress)
+            worker.log_message.connect(progress.append_log)
+            worker.log_message.connect(self._append_log)
+            worker.migration_complete.connect(lambda ok, result: self._migration_complete(progress, ok, result))
+            progress.cancel_requested.connect(worker.cancel)
+            worker.start()
+            progress.exec_()
+            worker.wait()
+            worker.deleteLater()
+            self.migration_worker = None
+        except Exception as exc:
+            QMessageBox.critical(self, _("Error"), str(exc))
 
     def _build_plan(self, base_dn: str):
         """
@@ -687,7 +893,8 @@ class MainWindow(QMainWindow):
             config['username']
         )
 
-        connector = LDAPConnector(
+        cls = source_connector_class(config.get('source_type', 'ad')) if dc_type == 'source' else LDAPConnector
+        connector = cls(
             host=config['host'],
             port=config['port'],
             domain=config['domain'],
@@ -719,6 +926,9 @@ class MainWindow(QMainWindow):
 
     def _start_migration(self):
         """Start migration process"""
+        if self.config_manager.get_source_dc_config().get('source_type', 'ad') == 'freeipa':
+            self._start_freeipa_migration()
+            return
         if not self.analysis_result:
             QMessageBox.warning(self, _("Error"), _("Please run analysis first"))
             return
@@ -735,7 +945,7 @@ class MainWindow(QMainWindow):
             migration_opts = self.config_manager.get_migration_config()
 
             # Setup database and logger
-            self.migration_db = MigrationDB()
+            self.migration_db = MigrationDB(self.config_manager.get_database_path())
 
             # Create progress window
             progress_window = ProgressWindow(self)

@@ -204,6 +204,17 @@ class ProgressWindow(QDialog):
         """Check if migration was cancelled"""
         return self.migration_cancelled
 
+    def reject(self):
+        # Escape/window close must not detach the UI from a running LDAP worker.
+        if self.migration_complete:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.migration_complete:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
 
 if __name__ == "__main__":
     import sys

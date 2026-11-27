@@ -44,6 +44,7 @@ class ReportGenerator:
         if not stats:
             raise ValueError(f"No statistics found for run_id {run_id}")
 
+        stats['attribute_details'] = [row for row in self.migration_db.get_errors(run_id) if row['phase'] == 'attributes']
         stats['reference_details'] = [row for row in self.migration_db.get_errors(run_id)
                                       if row['phase'] == settings.PHASE_REFERENCES]
         stats['password_details'] = [row for row in self.migration_db.get_errors(run_id)
@@ -81,6 +82,7 @@ class ReportGenerator:
         if not stats:
             raise ValueError(f"No statistics found for run_id {run_id}")
 
+        stats['attribute_details'] = [row for row in self.migration_db.get_errors(run_id) if row['phase'] == 'attributes']
         stats['reference_details'] = [row for row in self.migration_db.get_errors(run_id)
                                       if row['phase'] == settings.PHASE_REFERENCES]
         stats['password_details'] = [row for row in self.migration_db.get_errors(run_id)
@@ -284,6 +286,9 @@ class ReportGenerator:
         <h2>Password setup</h2>
         {self._verification_html(stats.get('password_details', []))}
 
+        <h2>Optional attribute warnings</h2>
+        {self._attribute_html(stats.get('attribute_details', []))}
+
         <h2>Verification details</h2>
         {self._verification_html(stats.get('verification_details', []))}
 
@@ -299,6 +304,11 @@ class ReportGenerator:
 </html>"""
 
         return html
+
+    def _attribute_html(self, rows):
+        return self._verification_html([
+            dict(row, error_message=(str(row.get('object_dn')) + ': ' if row.get('object_dn') else '') +
+                 str(row['error_message'])) for row in rows])
 
     @staticmethod
     def _verification_html(rows):
@@ -418,6 +428,12 @@ class ReportGenerator:
         for row in stats.get('verification_details', []):
             lines.append(f"[{row['severity']}] {row['error_message']}")
         lines.append("")
+
+        if stats.get('attribute_details'):
+            lines.append('OPTIONAL ATTRIBUTE WARNINGS')
+            for row in stats['attribute_details']:
+                lines.append(f"[{row['severity']}] {row.get('object_dn', '')}: {row['error_message']}")
+            lines.append('')
 
         # Footer
         lines.append("=" * 80)

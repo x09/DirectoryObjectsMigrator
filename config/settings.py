@@ -6,9 +6,9 @@ from pathlib import Path
 
 # Application metadata
 APP_NAME = "DirectoryObjectsMigrator"
-APP_VERSION = "1.3.0"
+APP_VERSION = "2.0"
 APP_AUTHOR = "Anton"
-APP_DESCRIPTION = "Active Directory to Samba AD Migration Tool"
+APP_DESCRIPTION = "Directory service object migrator (AD/FreeIPA) to Samba AD"
 
 # Paths
 HOME_DIR = Path.home()

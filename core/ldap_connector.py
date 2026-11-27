@@ -18,8 +18,10 @@ class LDAPConnectionError(Exception):
 
 
 class LDAPOperationError(Exception):
-    """LDAP operation error"""
-    pass
+    """LDAP operation error, optionally carrying a definitive server result code."""
+    def __init__(self, message, result_code=None):
+        super().__init__(message)
+        self.result_code = result_code
 
 
 class LDAPConnector:
@@ -656,13 +658,15 @@ class LDAPConnector:
             if not success:
                 result = self.connection.result
                 raise LDAPOperationError(
-                    f"Modify failed for {dn}: {result['description']} - {result.get('message', '')}"
+                    f"Modify failed for {dn}: {result['description']} - {result.get('message', '')}",
+                    result_code=result.get('result')
                 )
 
             return True
 
         except ldap3.core.exceptions.LDAPException as e:
-            raise LDAPOperationError(f"Modify error for {dn}: {e}")
+            raise LDAPOperationError(f"Modify error for {dn}: {e}",
+                                     result_code=getattr(e, 'result', None)) from e
 
     def modify_add_values(self, dn: str, changes: Dict[str, Any]) -> bool:
         """Add values to multi-valued attributes"""

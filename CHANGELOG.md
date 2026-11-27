@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.0] - 2026-11-26
+
+### Added
+- Optional FreeIPA login shortening with statistics, collision checks and persistent name assignments.
+- Add a FreeIPA attribute mapping editor persisted in INI, SSH public key storage in altSecurityIdentities and per-field warnings without blocking object creation.
+- Explicit recreation of tracked deleted FreeIPA users/groups with confirmation, identity checks, atomic mapping audit and source-link restoration.
+- FreeIPA source selection and read-only paged discovery with identity and effective read-right checks.
+- Migrate unlocked FreeIPA users, ordinary/nested groups and managers into selected existing Samba AD containers.
+- Optional RFC2307, personal groups with ipa-pg- names and implicit POSIX primary-group membership.
+- Explicit attribute mapping, multivalue mail/phone preservation and disabled users with new passwords.
+- Provider/instance-scoped history, explicit AD/FreeIPA run markers and selectable history database.
+- Stable preview validation, conflict checks, object/attribute/membership verification, cancellation and fault recovery.
+- Colored FreeIPA previews with remediation hints and exclusions followed by reanalysis.
+- Full-row selection and context-menu CSV export for AD/FreeIPA preview tables.
+
+### Changed
+- Hide the AD source Base DN controls in FreeIPA mode.
+- Persist source_provider in INI while reading legacy source_type settings.
+- Update About, translations, documentation and the ALT Linux spec for 2.0.
+- Keep external groups, blocked/staged/preserved accounts and FreeIPA policies outside the supported scope.
+
 ## [1.3.0] - 2026-10-29
 
 ### Fixed

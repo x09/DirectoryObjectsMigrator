@@ -6,7 +6,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "====================================="
-echo "Directory Objects Migrator v1.0"
+echo "Directory Objects Migrator v2.0"
 echo "Installation"
 echo "====================================="
 echo ""
@@ -27,7 +27,7 @@ if ! apt-get install -y \
     python3-module-PyQt5 \
     python3-modules-sqlite3 \
     python3-module-yaml \
-    gettext
+    gettext-tools
 then
     echo "" >&2
     echo "Error: package installation failed. Resolve the errors above and re-run." >&2
@@ -60,7 +60,7 @@ cat > "$DESKTOP_FILE" <<EOF
 Version=1.0
 Type=Application
 Name=Directory Objects Migrator
-Comment=Migrate objects from Microsoft AD to Samba AD
+Comment=Migrate directory service objects (AD/FreeIPA) to Samba AD
 Exec=bash -c '"$SCRIPT_DIR/run.sh"'
 Path=$SCRIPT_DIR
 Icon=$SCRIPT_DIR/resources/icon.svg
@@ -90,6 +90,6 @@ echo ""
 echo "Or launch 'Directory Objects Migrator' from the applications menu."
 echo ""
 echo "Before migrating anything, read:"
-echo "  QUICKSTART.md          - install and first run"
-echo "  docs/STATUS.md         - what is verified and what is not"
+echo "  README.md              - installation, migration and limitations"
+echo "  docs/USER_GUIDE.md      - operator workflow"
 echo ""

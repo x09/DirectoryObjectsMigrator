@@ -3,6 +3,7 @@ Configuration manager
 Handles loading/saving application configuration (connections, preferences)
 """
 import configparser
+import json
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from config import settings
@@ -37,6 +38,7 @@ class ConfigManager:
 
         # Source DC section
         self.config['SourceDC'] = {
+            'source_provider': 'ad',
             'host': '',
             'port': str(settings.DEFAULT_LDAP_PORT),
             'domain': '',
@@ -118,7 +120,15 @@ class ConfigManager:
 
     def get_source_dc_config(self) -> Dict[str, Any]:
         """Get source DC configuration"""
+        provider = self.config.get('SourceDC', 'source_provider', fallback=
+                                   self.config.get('SourceDC', 'source_type', fallback='ad'))
         return {
+            'source_provider': provider,
+            'source_type': provider,  # Compatibility alias for existing callers.
+            'rfc2307': self.config.getboolean('SourceDC', 'rfc2307', fallback=False),
+            'shorten_long_logins': self.config.getboolean('SourceDC', 'shorten_long_logins', fallback=False),
+            'users_target_dn': self.config.get('SourceDC', 'users_target_dn', fallback=''),
+            'groups_target_dn': self.config.get('SourceDC', 'groups_target_dn', fallback=''),
             'host': self.config.get('SourceDC', 'host', fallback=''),
             'port': self.config.getint('SourceDC', 'port', fallback=settings.DEFAULT_LDAP_PORT),
             'domain': self.config.get('SourceDC', 'domain', fallback=''),
@@ -131,6 +141,15 @@ class ConfigManager:
         if not self.config.has_section('SourceDC'):
             self.config.add_section('SourceDC')
 
+        provider = config.get('source_provider', config.get('source_type', 'ad'))
+        if provider not in ('ad', 'freeipa'):
+            raise ValueError('Unknown source type')
+        self.config.set('SourceDC', 'source_provider', provider)
+        self.config.remove_option('SourceDC', 'source_type')
+        self.config.set('SourceDC', 'rfc2307', str(config.get('rfc2307', False)))
+        self.config.set('SourceDC', 'shorten_long_logins', str(config.get('shorten_long_logins', False)))
+        for key in ('users_target_dn', 'groups_target_dn'):
+            self.config.set('SourceDC', key, config.get(key, ''))
         self.config.set('SourceDC', 'host', config.get('host', ''))
         self.config.set('SourceDC', 'port', str(config.get('port', settings.DEFAULT_LDAP_PORT)))
         self.config.set('SourceDC', 'domain', config.get('domain', ''))
@@ -140,6 +159,16 @@ class ConfigManager:
         self.save()
 
     # Destination DC settings
+
+    def get_database_path(self) -> Path:
+        configured = self.config.get('Application', 'migration_db', fallback='').strip()
+        return Path(configured).expanduser().resolve() if configured else settings.DB_FILE
+
+    def set_database_path(self, path) -> None:
+        if not self.config.has_section('Application'):
+            self.config.add_section('Application')
+        self.config.set('Application', 'migration_db', str(Path(path).expanduser().resolve()))
+        self.save()
 
     def get_dest_dc_config(self) -> Dict[str, Any]:
         """Get destination DC configuration"""
@@ -203,6 +232,23 @@ class ConfigManager:
         if not self.config.has_section('Migration'):
             self.config.add_section('Migration')
         self.config.set('Migration', 'last_base_dn', base_dn)
+        self.save()
+
+    def get_freeipa_mappings(self):
+        from core.freeipa_attributes import default_mappings
+        raw = self.config.get('FreeIPAAttributeMappings', 'rows', fallback=None)
+        if raw is None:
+            return default_mappings()
+        rows = json.loads(raw)
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError('Invalid FreeIPA attribute mapping configuration')
+        return rows
+
+    def set_freeipa_mappings(self, rows):
+        if not self.config.has_section('FreeIPAAttributeMappings'):
+            self.config.add_section('FreeIPAAttributeMappings')
+        self.config.set('FreeIPAAttributeMappings', 'rows',
+                        json.dumps(rows, ensure_ascii=False).replace('%', '%%'))
         self.save()
 
     # Operator-defined exclusions

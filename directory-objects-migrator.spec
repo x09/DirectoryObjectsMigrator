@@ -1,9 +1,9 @@
 %define _unpackaged_files_terminate_build 1
 
 Name: DirectoryObjectsMigrator
-Version: 1.3
+Version: 2.0
 Release: alt1
-Summary: A tool for migrating Active Directory objects from Microsoft AD to Samba AD
+Summary: Migrate directory service objects from AD or FreeIPA to Samba AD
 License: %gpl3only
 Group: System/Configuration/Other
 Url: https://github.com/x09/DirectoryObjectsMigrator
@@ -15,66 +15,66 @@ BuildRequires: rpm-build-licenses
 
 Requires: python3-module-ldap3
 Requires: python3-module-PyQt5
-Requires: python3-modules-sqlite3 
+Requires: python3-modules-sqlite3
 Requires: python3-module-yaml
 
-Source0: %name-v%version.tgz
+Source0: %name-v%version.tar.gz
 
 %add_python3_path %_datadir/%name
 
 %description -l ru_RU.UTF-8
-Directory Objects Migrator — инструмент для миграции объектов Active Directory
-из Microsoft AD в Samba AD
+Мигратор объектов службы каталога (AD/FreeIPA) в Samba AD.
+Переносит OU, пользователей, группы и контакты из AD, пользователей и группы
+из FreeIPA. Поддерживает предпросмотр, историю, проверку результата и RFC2307.
 
 %description
-Directory Objects Migrator is a utility designed to migrate Active Directory
-objects from a Microsoft Active Directory domain to a Samba Active Directory
-domain
+Migrate directory service objects from Microsoft AD, Samba AD or FreeIPA to
+Samba AD. Supports AD OUs, users, groups and contacts, FreeIPA users and groups,
+preview, migration history, verification and optional RFC2307 attributes.
 
 %prep
-%setup -q -n %name-v%version 
+%setup -q -n %name-v%version
+
+%build
+for language in ru en; do
+    msgfmt locale/$language/LC_MESSAGES/DirectoryObjectMigrator.po \
+        -o locale/$language/LC_MESSAGES/DirectoryObjectMigrator.mo
+done
 
 %install
 for language in ru en; do
-	mkdir -p %buildroot/%_datadir/locale/$language/LC_MESSAGES/
-	install -m644 locale/$language/LC_MESSAGES/DirectoryObjectMigrator.mo %buildroot/%_datadir/locale/$language/LC_MESSAGES/
+    install -D -m644 locale/$language/LC_MESSAGES/DirectoryObjectMigrator.mo \
+        %buildroot%_datadir/locale/$language/LC_MESSAGES/DirectoryObjectMigrator.mo
 done
 
-mkdir -p %buildroot/%_datadir/%name/{gui,core,utils,database,resources,config}
-mkdir  %buildroot/%_datadir/%name/core/object_handlers/
-
-cp -r gui/* %buildroot/%_datadir/%name/gui/
-cp -r core/* %buildroot/%_datadir/%name/core/
-cp -r utils/* %buildroot/%_datadir/%name/utils/
-cp -r database/* %buildroot/%_datadir/%name/database/
-cp -r resources/* %buildroot/%_datadir/%name/resources/
-cp -r config/* %buildroot/%_datadir/%name/config/
-
-mkdir -p %buildroot/%_iconsdir
-cp resources/icon.svg %buildroot/%_iconsdir/%name.svg
-
-mkdir -p  %buildroot/%_desktopdir
-cp %name.desktop %buildroot/%_desktopdir/%name.desktop
-
-
-mkdir -p %buildroot/%_bindir/
-cp main.py %buildroot/%_bindir/%name
-chmod 755 %buildroot/%_bindir/%name
-
-
-#%check
-#%__python3 -m pytest -vra tests/
+# Install runtime sources and data only, including the FreeIPA source package.
+find gui core utils database config -type f \
+    \( -name '*.py' -o -name '*.yaml' -o -name '*.sql' \) | while read -r file; do
+    install -D -m644 "$file" "%buildroot%_datadir/%name/$file"
+done
+find resources -type f \( -name '*.svg' -o -name '*.png' \) | while read -r file; do
+    install -D -m644 "$file" "%buildroot%_datadir/%name/$file"
+done
+install -D -m644 resources/icon.svg %buildroot%_iconsdir/%name.svg
+install -D -m644 %name.desktop %buildroot%_desktopdir/%name.desktop
+install -D -m755 main.py %buildroot%_bindir/%name
 
 %files
-%doc README.md 
+%doc README.md CHANGELOG.md LICENSE docs/USER_GUIDE.md docs/ARCHITECTURE.md
 %_bindir/%name
 %_desktopdir/%name.desktop
-%_datadir/%name/*
-%_datadir/locale/*
+%_datadir/%name/
+%_datadir/locale/ru/LC_MESSAGES/DirectoryObjectMigrator.mo
+%_datadir/locale/en/LC_MESSAGES/DirectoryObjectMigrator.mo
 %_iconsdir/%name.svg
 
-
 %changelog
+* Thu Nov 26 2026 Anton Shevtsov <shevtsov.anton@gmail.com> 2.0-alt1
+- Add FreeIPA migration, RFC2307 and confirmed recreation of deleted tracked objects.
+- Add configurable FreeIPA attribute mappings and optional shortening of long logins.
+- Improve migration preview, conflict guidance, row selection and CSV export.
+- Update translations, documentation and application metadata.
+
 * Thu Oct 29 2026 Anton Shevtsov <shevtsov.anton@gmail.com> 1.3-alt1
 - Exclude DNS service groups and report unsupported references as skipped.
 - Preserve skipped-reference history without treating it as resolved.

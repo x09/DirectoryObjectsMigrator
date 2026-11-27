@@ -533,6 +533,7 @@ class Migrator:
             'use_tls': self.source_conn.use_tls,
             'password_mode': 'random',  # Don't store actual mode
             'options': {
+                'source_provider': 'ad',
                 'batch_size': self.batch_size,
                 'dry_run': self.dry_run,
             }

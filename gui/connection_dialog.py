@@ -6,11 +6,12 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLineEdit, QSpinBox, QCheckBox, QPushButton, QLabel,
     QRadioButton, QButtonGroup, QMessageBox, QTabWidget, QWidget, QTextEdit,
-    QScrollArea, QSizePolicy, QLayout
+    QScrollArea, QSizePolicy, QLayout, QComboBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
 
+from core.sources import source_connector_class
 from core.ldap_connector import LDAPConnector, LDAPConnectionError
 from utils.config_manager import ConfigManager
 from utils.i18n import _
@@ -39,6 +40,7 @@ class ConnectionDialog(QDialog):
     def __init__(self, config_manager: ConfigManager, parent=None):
         super().__init__(parent)
         self.config_manager = config_manager
+        self.database_path = self.config_manager.get_database_path()
         self.setWindowTitle(_("Connection Settings"))
         self.setMinimumWidth(600)
         self.setModal(True)
@@ -68,6 +70,11 @@ class ConnectionDialog(QDialog):
         # Custom exclusions tab
         self.exclusions_tab = self._create_exclusions_tab()
         self.tabs.addTab(self.exclusions_tab, _("Custom Exclusions"))
+
+        from gui.freeipa_attribute_settings import FreeIPAAttributeSettings
+        self.attribute_mappings_tab = FreeIPAAttributeSettings(self.config_manager.get_freeipa_mappings())
+        self.attribute_mappings_index = self.tabs.addTab(self.attribute_mappings_tab, _("FreeIPA attributes"))
+        self._source_type_changed()
 
         layout.addWidget(self.tabs)
 
@@ -106,6 +113,36 @@ class ConnectionDialog(QDialog):
         # Connection group
         conn_group = QGroupBox(_("Connection"))
         conn_layout = QFormLayout()
+
+        if dc_type == 'source':
+            self.source_type = QComboBox()
+            self.source_type.addItem("Active Directory (MS AD / Samba AD)", 'ad')
+            self.source_type.addItem("FreeIPA", 'freeipa')
+            conn_layout.addRow(_("Source type:"), self.source_type)
+            self.source_rfc2307 = QCheckBox(_("Include RFC2307 attributes and personal groups"))
+            conn_layout.addRow(self.source_rfc2307)
+            self.source_shorten_logins = QCheckBox(_("Shorten user logins longer than 20 characters"))
+            self.source_shorten_logins.setToolTip(_("Use a prefix and a numeric suffix (at least 3 digits). Analysis shows the count and proposed names. Names saved in migration history are reused."))
+            conn_layout.addRow(self.source_shorten_logins)
+            self.freeipa_note = WrappedPolicyLabel(_("FreeIPA: choose destination containers for users and groups. Personal groups use the ipa-pg- prefix."))
+            self.freeipa_note.setWordWrap(True)
+            conn_layout.addRow(self.freeipa_note)
+            self.freeipa_targets = QWidget()
+            targets_layout = QFormLayout(self.freeipa_targets)
+            targets_layout.setContentsMargins(0, 0, 0, 0)
+            for kind, label in [('users', _("Destination for users:")), ('groups', _("Destination for groups:"))]:
+                field = QLineEdit()
+                field.setPlaceholderText(_("Empty: CN=Users in the destination domain"))
+                setattr(self, kind + '_target_dn', field)
+                row = QHBoxLayout()
+                row.addWidget(field)
+                browse = QPushButton(_("Browse…"))
+                browse.clicked.connect(lambda checked=False, target=field: self._browse_destination(target))
+                row.addWidget(browse)
+                targets_layout.addRow(label, row)
+            conn_layout.addRow(self.freeipa_targets)
+            self.source_type.currentIndexChanged.connect(self._source_type_changed)
+            self._source_type_changed()
 
         # Host
         host_input = QLineEdit()
@@ -150,6 +187,29 @@ class ConnectionDialog(QDialog):
         layout.addStretch()
 
         return widget
+
+    def _source_type_changed(self, *args):
+        ipa = self.source_type.currentData() == 'freeipa'
+        self.source_rfc2307.setVisible(ipa)
+        self.source_shorten_logins.setVisible(ipa)
+        self.freeipa_note.setVisible(ipa)
+        self.freeipa_targets.setVisible(ipa)
+        if hasattr(self, 'attribute_mappings_index'):
+            self.tabs.setTabEnabled(self.attribute_mappings_index, ipa)
+            if not ipa and self.tabs.currentIndex() == self.attribute_mappings_index:
+                self.tabs.setCurrentIndex(0)
+        self.setMinimumWidth(900 if ipa else 600)
+
+    def _browse_destination(self, field):
+        from gui.branch_dialog import BranchDialog
+        params = self.get_dest_connection_params()
+        if not all(params.get(key) for key in ('host', 'domain', 'username', 'password')):
+            QMessageBox.warning(self, _("Error"), _("Fill in the destination connection and password first."))
+            return
+        dialog = BranchDialog(params, self, destination=True)
+        if dialog.exec_() == QDialog.Accepted:
+            field.setText(dialog.selected_dn)
+        dialog.deleteLater()
 
     def _create_options_tab(self) -> QWidget:
         """Create migration options tab"""
@@ -233,6 +293,10 @@ class ConnectionDialog(QDialog):
         self.db_status_label.setWordWrap(True)
         db_layout.addWidget(self.db_status_label)
 
+        self.choose_db_btn = QPushButton(_("Use existing migration history…"))
+        self.choose_db_btn.clicked.connect(self._choose_database)
+        db_layout.addWidget(self.choose_db_btn)
+
         reset_row = QHBoxLayout()
         self.reset_db_btn = QPushButton(_("Reset Database"))
         self.reset_db_btn.clicked.connect(self._reset_database)
@@ -273,6 +337,13 @@ class ConnectionDialog(QDialog):
         scroll.setWidget(widget)
         return scroll
 
+    def _choose_database(self):
+        from gui.migration_table import choose_history_file
+        path = choose_history_file(self, self.database_path)
+        if path:
+            self.database_path = path
+            self._refresh_db_status()
+
     def _create_exclusions_tab(self) -> QWidget:
         """Create custom exclusions configuration tab"""
         tab = QWidget()
@@ -309,7 +380,7 @@ class ConnectionDialog(QDialog):
         try:
             from database.migration_db import MigrationDB
 
-            with MigrationDB() as db:
+            with MigrationDB(self.database_path) as db:
                 counts = db.counts()
                 runs = counts.get('migration_runs', 0)
                 objects = counts.get('migration_map', 0)
@@ -322,7 +393,7 @@ class ConnectionDialog(QDialog):
             return
 
         self.db_status_label.setText(
-            f"<b>{_('File')}:</b> {settings.DB_FILE}<br>"
+            f"<b>{_('File')}:</b> {self.database_path}<br>"
             f"<b>{_('Migration runs')}:</b> {runs} &nbsp;|&nbsp; "
             f"<b>{_('Tracked objects')}:</b> {objects} &nbsp;|&nbsp; "
             f"<b>{_('Pending references')}:</b> {deferred}"
@@ -340,7 +411,7 @@ class ConnectionDialog(QDialog):
         from database.migration_db import MigrationDB
 
         try:
-            with MigrationDB() as db:
+            with MigrationDB(self.database_path) as db:
                 counts = db.counts()
                 total = sum(counts.values())
 
@@ -394,7 +465,7 @@ class ConnectionDialog(QDialog):
         from database.migration_db import MigrationDB
 
         try:
-            with MigrationDB() as db:
+            with MigrationDB(self.database_path) as db:
                 info = db.vacuum()
         except Exception as e:
             QMessageBox.critical(
@@ -435,6 +506,11 @@ class ConnectionDialog(QDialog):
         """Load settings from config"""
         # Source DC
         source_config = self.config_manager.get_source_dc_config()
+        self.source_type.setCurrentIndex(max(0, self.source_type.findData(source_config.get('source_type', 'ad'))))
+        self.source_rfc2307.setChecked(source_config.get('rfc2307', False))
+        self.source_shorten_logins.setChecked(source_config.get('shorten_long_logins', False))
+        self.users_target_dn.setText(source_config.get('users_target_dn', ''))
+        self.groups_target_dn.setText(source_config.get('groups_target_dn', ''))
         self.source_host.setText(source_config.get('host', ''))
         self.source_port.setValue(source_config.get('port', settings.DEFAULT_LDAP_PORT))
         self.source_domain.setText(source_config.get('domain', ''))
@@ -470,7 +546,7 @@ class ConnectionDialog(QDialog):
             QMessageBox.warning(self, _("Error"), _("Please fill in all Source DC fields"))
             return
 
-        if not self.dest_host.text() or not self.dest_domain.text():
+        if self.source_type.currentData() == 'ad' and (not self.dest_host.text() or not self.dest_domain.text()):
             QMessageBox.warning(self, _("Error"), _("Please fill in all Destination DC fields"))
             return
 
@@ -478,8 +554,15 @@ class ConnectionDialog(QDialog):
             QMessageBox.warning(self, _("Error"), _("Please enter fixed password or choose random mode"))
             return
 
+        self.config_manager.set_database_path(self.database_path)
+
         # Save source DC
         self.config_manager.set_source_dc_config({
+            'source_provider': self.source_type.currentData(),
+            'rfc2307': self.source_rfc2307.isChecked(),
+            'shorten_long_logins': self.source_shorten_logins.isChecked(),
+            'users_target_dn': self.users_target_dn.text().strip(),
+            'groups_target_dn': self.groups_target_dn.text().strip(),
             'host': self.source_host.text(),
             'port': self.source_port.value(),
             'domain': self.source_domain.text(),
@@ -504,6 +587,9 @@ class ConnectionDialog(QDialog):
             'password_length': self.password_length.value(),
             'fixed_password': self.fixed_password.text() if password_mode == settings.PASSWORD_MODE_FIXED else '',
         })
+
+        if self.source_type.currentData() == 'freeipa':
+            self.config_manager.set_freeipa_mappings(self.attribute_mappings_tab.rows())
 
         # Save custom exclusions
         self.config_manager.set_custom_exclusions(self.exclusions_text.toPlainText())
@@ -537,7 +623,8 @@ class ConnectionDialog(QDialog):
             return
 
         try:
-            connector = LDAPConnector(
+            cls = source_connector_class(self.source_type.currentData()) if dc_type == 'source' else LDAPConnector
+            connector = cls(
                 host=host,
                 port=port,
                 domain=domain,

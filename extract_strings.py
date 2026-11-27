@@ -20,11 +20,34 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent
 LOCALE_DIR = PROJECT_ROOT / 'locale'
-SKIP_DIRS = {'tests', '__pycache__', 'locale', 'logs', 'docs'}
+SKIP_DIRS = {'tests', '__pycache__', 'locale', 'logs', 'docs', 'work', '.venv', '.git'}
 
 # Strings passed to _() through a variable or lookup, so the AST cannot see them.
 # Keep this in sync by hand when adding dynamic translation lookups.
 DYNAMIC_STRINGS = {
+    'Invalid destination account name: ',
+    'Destination CN exceeds 64 characters: ',
+    'Invalid RFC2307 value: ',
+    'Existing RFC2307 attributes differ; automatic overwrite is blocked',
+    'Password setup previously failed; reset the target password before retrying',
+
+    'Missing or ambiguous personal group owner',
+    'Insufficient confirmed FreeIPA read rights',
+    'Destination DN already exists',
+    'Duplicate planned destination identity',
+    'Multiple managers cannot be represented in AD',
+    'Missing or ambiguous POSIX primary group',
+    'POSIX primary group is excluded or unavailable',
+    'Manager is not a user',
+    'Referenced object is outside the readable accounts tree',
+    'Source object type changed',
+
+    'Missing, invalid or duplicate ipaUniqueID', 'Missing or ambiguous account name',
+    'Excluded by operator', 'Blocked FreeIPA user', 'Cannot determine FreeIPA account lock status',
+    'FreeIPA administrative account', 'External groups are not supported',
+    'FreeIPA system group', 'Personal group requires RFC2307',
+    'Personal group owner is excluded or unavailable',
+
     # Engine progress messages translated at the GUI boundary.
     'Analyzing source domain...', 'Creating organizational units...',
     'Creating objects...', 'Copying attributes...', 'Resolving references...',

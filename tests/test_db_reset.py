@@ -74,6 +74,10 @@ def main():
     result = Migrator(source_conn=src, dest_conn=dst, migration_db=db,
                       logger=logger).migrate(L2)
     counts = db.counts()
+    # Verification now records warning/error rows as well as the six original
+    # bookkeeping rows. Check backup content, not a historical fixed count.
+    original_rows = {table: [tuple(row) for row in db.connection.execute(
+        'SELECT * FROM ' + table + ' ORDER BY rowid')] for table in counts}
 
     check("run recorded", counts['migration_runs'], 1)
     check("three objects tracked", counts['migration_map'], 3)
@@ -85,7 +89,7 @@ def main():
     print("\n=== Reset clears everything and backs up first ===")
     info = db.reset(make_backup=True)
 
-    check("reported total matches what was there", info['total'], 6)
+    check("reported total matches what was there", info['total'], sum(counts.values()))
     check("backup path returned", info['backup_path'] is not None, True)
     check("backup exists on disk", info['backup_path'].exists(), True)
     check("all tables empty afterwards", sum(db.counts().values()), 0)
@@ -102,7 +106,10 @@ def main():
 
     print("\n=== The backup still holds the old history ===")
     with MigrationDB(info['backup_path']) as backup_db:
-        check("backup has the original rows", sum(backup_db.counts().values()), 6)
+        check("backup has the original rows", backup_db.counts(), counts)
+        for table, rows in original_rows.items():
+            check('backup preserves ' + table, [tuple(row) for row in backup_db.connection.execute(
+                'SELECT * FROM ' + table + ' ORDER BY rowid')], rows)
         check("backup retains the tracked objects",
               backup_db.counts()['migration_map'], 3)
 

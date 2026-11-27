@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS migration_map (
 
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_migration_map_source_guid ON migration_map(source_guid);
+-- The compatibility lookup accepts old braced/uppercase IDs. Keep it indexed
+-- so large groups do not trigger a full mapping scan for each participant.
+CREATE INDEX IF NOT EXISTS idx_migration_map_direction_native_id
+    ON migration_map(direction_id, lower(replace(replace(source_guid,'{',''),'}','')));
 CREATE INDEX IF NOT EXISTS idx_migration_map_dest_guid ON migration_map(dest_guid);
 CREATE INDEX IF NOT EXISTS idx_migration_map_source_dn ON migration_map(source_dn);
 CREATE INDEX IF NOT EXISTS idx_migration_map_dest_dn ON migration_map(dest_dn);

@@ -40,8 +40,8 @@ class MigrationDB:
         'mark_reference_resolved', 'mark_reference_skipped', 'update_reference_check', 'add_conflict',
         'get_conflicts', 'log_error', 'get_errors', 'get_statistics', 'close',
         'counts', 'is_empty', 'backup', 'reset', 'vacuum',
-        'for_direction', 'refresh_mapping', 'has_unassigned_history',
-        'get_reference_parents_for_run',
+        'for_direction', 'for_source', 'refresh_mapping', 'has_unassigned_history',
+        'get_reference_parents_for_run', 'replace_missing_mapping', 'get_freeipa_login_assignments',
     )
 
     def _install_locking(self):
@@ -176,6 +176,27 @@ class MigrationDB:
 
     def has_unassigned_history(self):
         return bool(self.connection.execute("SELECT 1 FROM migration_map WHERE direction_id='' LIMIT 1").fetchone())
+
+    def for_source(self, provider, source_identity, dest_identity, source_domain, dest_domain):
+        """Provider-scoped IDs. Never attribute legacy AD history to FreeIPA.
+
+        source_guid is the historical column name; in a FreeIPA direction its
+        value is the native ipaUniqueID, not an invented AD objectGUID.
+        Existing AD direction keys and database schema remain unchanged.
+        """
+        if provider == 'ad':
+            return self.for_direction(source_identity, dest_identity, source_domain, dest_domain)
+        if provider != 'freeipa':
+            raise ValueError('Unsupported source provider')
+        key = hashlib.sha256(json.dumps([provider, source_identity, dest_identity]).encode()).hexdigest()
+        if self.direction_id is not None and self.direction_id != key:
+            raise ValueError('Database view belongs to another migration direction')
+        view = object.__new__(MigrationDB)
+        view.db_path, view.connection = self.db_path, self.connection
+        view._lock, view.direction_id = self._lock, key
+        view._owner = self._owner or self
+        view._install_locking()
+        return view
 
     @staticmethod
     def _guid(value):
@@ -505,13 +526,14 @@ class MigrationDB:
         source_sid: Optional[str] = None,
         source_sam: Optional[str] = None,
         object_class: Optional[str] = None,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        notes: Optional[str] = None
     ):
         """
         Add or update object mapping
 
         Args:
-            source_guid: Source objectGUID
+            source_guid: Native source ID (AD objectGUID or FreeIPA ipaUniqueID)
             source_dn: Source DN
             dest_guid: Destination objectGUID
             dest_dn: Destination DN
@@ -551,15 +573,74 @@ class MigrationDB:
                 INSERT INTO migration_map (
                     direction_id, source_guid, source_dn, source_sid, source_sam_account_name,
                     dest_guid, dest_dn, object_type, object_class, status,
-                    migration_run_id, first_migration_run_id, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    migration_run_id, first_migration_run_id, error_message, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 direction, source_guid, source_dn, source_sid, source_sam,
                 dest_guid, dest_dn, object_type, object_class, status,
-                run_id, run_id, error_message
+                run_id, run_id, error_message, notes
             ))
 
         self.connection.commit()
+
+    def get_freeipa_login_assignments(self):
+        """Names are scoped to a native direction and retained even after deletion.
+
+        Store them with the original mapping, atomically with its first insert.
+        Status updates and explicit recreation preserve mapping notes.
+        """
+        if self.direction_id is None:
+            raise ValueError('A migration direction is required')
+        assignments = {}
+        for row in self.connection.execute(
+                "SELECT source_guid, notes FROM migration_map WHERE direction_id=? AND notes IS NOT NULL",
+                (self.direction_id,)):
+            try:
+                metadata = json.loads(row['notes'])
+            except (ValueError, TypeError):
+                continue  # Legacy free-form notes.
+            if isinstance(metadata, dict) and 'freeipa_login' in metadata:
+                name = metadata['freeipa_login']
+                if not isinstance(name, str) or not name:
+                    raise ValueError('Invalid saved FreeIPA login assignment')
+                assignments[row['source_guid']] = name
+        return assignments
+
+    def replace_missing_mapping(self, source_id, expected, source_dn, dest_guid, dest_dn,
+                                run_id, password_pending=None):
+        """Atomically replace an explicitly approved mapping and retain its audit trail.
+
+        LDAP absence/collision checks belong to the caller. Compare-and-swap here
+        prevents a concurrent history change from losing the original mapping.
+        """
+        direction = self._run_direction(run_id)
+        if self.direction_id is None or direction != expected['direction_id']:
+            raise ValueError('Recreation belongs to another migration direction')
+        if self._guid(dest_guid) == self._guid(expected['old_guid']):
+            raise ValueError('Recreation must have a new destination GUID')
+        with self.connection:
+            cursor = self.connection.execute("""UPDATE migration_map SET
+                source_dn=?, dest_guid=?, dest_dn=?, dest_sid=NULL, status=?,
+                last_seen=CURRENT_TIMESTAMP, last_updated=CURRENT_TIMESTAMP,
+                migration_run_id=?, error_message=?
+                WHERE direction_id=? AND lower(replace(replace(source_guid,'{',''),'}',''))=?
+                AND lower(replace(replace(dest_guid,'{',''),'}',''))=?
+                AND dest_dn=? AND object_type=?""",
+                (source_dn, self._guid(dest_guid), dest_dn, 'error' if password_pending else 'created',
+                 run_id, password_pending, direction, self._guid(source_id), self._guid(expected['old_guid']),
+                 expected['old_dn'], expected['object_type']))
+            if cursor.rowcount != 1:
+                raise ValueError('Migration history changed; confirm recreation again')
+            audit = json.dumps({'source_id': source_id, 'old_guid': expected['old_guid'],
+                                'old_dn': expected['old_dn'], 'new_guid': self._guid(dest_guid),
+                                'new_dn': dest_dn}, ensure_ascii=False)
+            self.connection.execute("""INSERT INTO migration_errors
+                (migration_run_id, severity, phase, object_dn, object_type, error_message)
+                VALUES (?, 'INFO', 'recreate', ?, ?, ?)""",
+                (run_id, source_dn, expected['object_type'], audit))
+            self.connection.execute("""UPDATE deferred_references SET parent_object_dn=?
+                WHERE direction_id=? AND parent_object_guid=? AND resolved=0""",
+                (dest_dn, direction, source_id))
 
     def _find_mapping(self, column, value):
         where = column + '=?'

@@ -16,6 +16,7 @@ from PyQt5.QtGui import QColor
 
 from core.analyzer import AnalysisResult
 from utils.i18n import _
+from gui.migration_table import MigrationTable
 from config import settings
 
 # Row background colours, mirroring the log status vocabulary
@@ -121,7 +122,7 @@ class PreviewDialog(QDialog):
 
     @staticmethod
     def _make_table(headers):
-        table = QTableWidget()
+        table = MigrationTable()
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.setEditTriggers(QTableWidget.NoEditTriggers)

@@ -18,6 +18,14 @@ PROJECT_ROOT = TESTS_DIR.parent
 
 # Ordered so that fast, low-level checks fail first
 SUITES = [
+    ("FreeIPA shortened logins and stable naming", "test_freeipa_logins.py", False),
+    ("FreeIPA configurable attributes and isolated field failures", "test_freeipa_attributes.py", False),
+    ("Explicit FreeIPA recreation and mapping audit", "test_freeipa_recreation.py", False),
+    ("History reset, complete backup and destination preservation", "test_db_reset.py", False),
+    ("V2 interface, history selection and CSV export", "test_v2_interface.py", True),
+    ("FreeIPA large groups, cancellation and fault recovery", "test_freeipa_resilience.py", False),
+    ("FreeIPA migration, identity isolation and verification", "test_freeipa_migration.py", False),
+    ("FreeIPA discovery and source selection", "test_freeipa_source.py", True),
     ("Skipped references and DNS service groups", "test_skipped_references.py", False),
     ("Background analysis and translated progress", "test_analysis_progress.py", True),
     ("Complete ranged LDAP reads", "test_ranged_reads.py", False),
